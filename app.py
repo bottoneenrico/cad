@@ -326,6 +326,7 @@ def init_state():
         "trace_sig": None,
         "scale": "1:1",
         "token": None,
+        "widget_gen": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -638,6 +639,7 @@ def remove_trace():
     st.session_state.trace_path = None
     st.session_state.trace_sig = None
     st.session_state.current_step = 0
+    st.session_state.widget_gen += 1
 
 
 def assistant_page():
@@ -659,15 +661,33 @@ def assistant_page():
     col_up, col_scale = st.columns([2, 1])
     with col_up:
         st.markdown("#### 🖼️ Traccia dell'esercizio")
-        uploaded = st.file_uploader(
-            "Carica la foto della traccia (jpg, png, webp)",
-            type=ALLOWED_EXT,
-            key="trace_uploader",
+        gen = st.session_state.widget_gen
+        mode = st.radio(
+            "Come vuoi caricare la traccia?",
+            ["📁 Galleria / file", "📷 Fotocamera integrata"],
+            horizontal=True,
+            key="trace_source",
         )
-        if uploaded is not None:
-            sig = f"{uploaded.name}-{uploaded.size}"
+        if mode.startswith("📁"):
+            source = st.file_uploader(
+                "Carica la foto della traccia (jpg, png, webp)",
+                type=ALLOWED_EXT,
+                key=f"trace_uploader_{gen}",
+            )
+            st.caption(
+                "Consiglio da telefono: scatta prima la foto con l'app Fotocamera, "
+                "poi sceglila dalla galleria. Apri l'app nel browser (Chrome/Safari), "
+                "non dentro un'altra app."
+            )
+        else:
+            source = st.camera_input(
+                "Scatta la foto della traccia",
+                key=f"trace_camera_{gen}",
+            )
+        if source is not None:
+            sig = f"{source.name}-{source.size}"
             if sig != st.session_state.trace_sig:
-                save_upload(uploaded)
+                save_upload(source)
         if st.session_state.trace_path:
             if st.button("Rimuovi traccia"):
                 remove_trace()
