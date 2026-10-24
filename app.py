@@ -16,6 +16,7 @@ import math
 import re
 import os
 import secrets
+import time
 import sqlite3
 import uuid
 from pathlib import Path
@@ -673,7 +674,7 @@ LINE_STYLES = {
 AX = {"x": 0, "y": 1, "z": 2}
 CYL_FACETS = 96          # multiplo di 4
 MAX_PARTS = 40
-GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-flash-latest"]
 
 GEMINI_PROMPT = """Sei un esperto di disegno tecnico. L'immagine mostra l'esercizio di un libro di disegno
 (di solito un solido in assonometria o prospettiva con le quote, a volte con le viste).
@@ -1361,7 +1362,6 @@ def gemini_read_trace(path, key):
                 {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}},
             ]
         }],
-        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
     }
     models = []
     try:
@@ -1373,14 +1373,24 @@ def gemini_read_trace(path, key):
     models += [m for m in GEMINI_MODELS if m not in models]
 
     last = ""
+    t_start = time.time()
     for model in models:
+        if time.time() - t_start > 100:
+            break
+        cfg = {"temperature": 0.1, "responseMimeType": "application/json", "maxOutputTokens": 8192}
+        if "2.5" in model:
+            cfg["thinkingConfig"] = {"thinkingBudget": 0}   # risposta piu' veloce
+        body["generationConfig"] = cfg
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
             r = requests.post(
-                url, headers={"x-goog-api-key": key, "Content-Type": "application/json"}, json=body, timeout=120
+                url, headers={"x-goog-api-key": key, "Content-Type": "application/json"}, json=body, timeout=(10, 50)
             )
+        except requests.Timeout:
+            last = f"{model}: nessuna risposta entro 50 secondi."
+            continue
         except requests.RequestException as e:
-            last = f"Connessione non riuscita: {e}"
+            last = f"{model}: connessione non riuscita ({e})"
             continue
         if r.status_code == 200:
             try:
@@ -1389,7 +1399,7 @@ def gemini_read_trace(path, key):
                 text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                 return json.dumps(json.loads(text), ensure_ascii=False, indent=1)
             except Exception:
-                last = "Risposta di Gemini non leggibile: riprova."
+                last = f"{model}: risposta non leggibile, riprova."
                 continue
         try:
             msg = r.json().get("error", {}).get("message", "")
@@ -1399,7 +1409,7 @@ def gemini_read_trace(path, key):
             raise RuntimeError("Quota gratuita di Gemini esaurita: riprova tra qualche minuto o domani.")
         if r.status_code in (401, 403) or "API key" in msg:
             raise RuntimeError("La chiave API non è valida o non è abilitata.")
-        last = msg or f"Errore {r.status_code}"
+        last = f"{model}: {msg or 'errore ' + str(r.status_code)}"
     raise RuntimeError(last or "Nessun modello Gemini disponibile.")
 
 
@@ -1565,7 +1575,7 @@ def drawing_tab():
         if not key:
             st.error("Chiave Gemini non trovata nei Secrets dell'app.")
         else:
-            with st.spinner("Sto leggendo la traccia..."):
+            with st.spinner("Sto leggendo la traccia (anche 1 minuto)..."):
                 try:
                     st.session_state.solid = _clean_data(json.loads(gemini_read_trace(path, key)))
                     st.session_state.solid_gen += 1
