@@ -1,236 +1,1588 @@
-import streamlit as st
-import sqlite3
-import hashlib
-import os
-from PIL import Image
+# -*- coding: utf-8 -*-
+"""
+CAD Assistant — Proiezioni Ortogonali
+Creato da: ENRICO BOTTONE
 
-# --- CONFIGURAZIONE DELLA PAGINA ---
+Avvio:  streamlit run app.py
+Requisiti: streamlit>=1.30 (Pillow è già installato come dipendenza di Streamlit)
+"""
+
+import base64
+import hashlib
+import hmac
+import io
+import json
+import math
+import re
+import os
+import secrets
+import sqlite3
+import uuid
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+import numpy as np
+import requests
+import streamlit as st
+from PIL import Image, ImageOps
+
+# ----------------------------------------------------------------------------
+# CONFIGURAZIONE
+# ----------------------------------------------------------------------------
 st.set_page_config(
     page_title="CAD Assistant — Proiezioni Ortogonali",
     page_icon="📐",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-# --- STILE GRAFICO (DARK MODE ORIGINALE) ---
-st.markdown("""
-    <style>
-    .stApp {
-        background: radial-gradient(circle at 10% 20%, #0f172a 0%, #020617 90%);
-        color: #f1f5f9;
-        font-family: 'Inter', sans-serif;
-    }
-    .card, [data-testid="stForm"] {
-        background: rgba(30, 41, 59, 0.7);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        padding: 24px;
-        border-radius: 16px;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
-        margin-bottom: 20px;
-    }
-    .step-box {
-        background: rgba(37, 99, 235, 0.15);
-        border-left: 4px solid #38bdf8;
-        padding: 16px;
-        border-radius: 0 12px 12px 0;
-        margin: 15px 0;
-    }
-    .stButton>button, [data-testid="stFormSubmitButton"]>button {
-        background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
-        color: white;
-        border-radius: 10px;
-        font-weight: 600;
-        border: none;
-        padding: 10px 24px;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
-        transition: all 0.2s ease;
-        width: 100%;
-    }
-    .stButton>button:hover, [data-testid="stFormSubmitButton"]>button:hover {
-        background: linear-gradient(135deg, #1d4ed8 100%, #1e40af 100%);
-        box-shadow: 0 6px 16px rgba(37, 99, 235, 0.5);
-        transform: translateY(-1px);
-    }
-    .stTextInput>div>div>input, .stSelectbox>div>div>select {
-        background-color: rgba(15, 23, 42, 0.6) !important;
-        border: 1px solid rgba(255, 255, 255, 0.1) !important;
-        color: #f1f5f9 !important;
-        border-radius: 10px !important;
-    }
-    h1, h2, h3 {
-        color: #f8fafc;
-    }
-    h1 {
-        background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    </style>
-""", unsafe_allow_html=True)
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "cad_users.db"
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
 
-# --- GESTIONE DATABASE UTENTI ---
-def init_db():
-    conn = sqlite3.connect("cad_users.db", check_same_thread=False)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            name TEXT,
-            pin TEXT,
-            raw_pin TEXT,
-            role TEXT
+MAX_UPLOAD_MB = 15
+ALLOWED_EXT = ["jpg", "jpeg", "png", "webp"]
+SCALES = ["1:1", "1:2", "2:1", "1:5", "5:1", "1:10"]
+
+ROLE_DEV = "sviluppatore"
+ROLE_STUDENT = "studente"
+
+PBKDF2_ITERATIONS = 200_000
+
+
+# ----------------------------------------------------------------------------
+# DATABASE E AUTENTICAZIONE
+# ----------------------------------------------------------------------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def hash_password(password: str, salt_hex: str) -> str:
+    dk = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), PBKDF2_ITERATIONS
+    )
+    return dk.hex()
+
+
+def create_user(username: str, password: str, role: str) -> None:
+    salt = secrets.token_hex(16)
+    pwd_hash = hash_password(password, salt)
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, salt, role) VALUES (?, ?, ?, ?)",
+            (username, pwd_hash, salt, role),
         )
-    ''')
-    dev_pin_raw = "sviluppatore@"
-    dev_pin_hash = hashlib.sha256(dev_pin_raw.encode()).hexdigest()
-    res = conn.execute("SELECT * FROM users WHERE username = 'DEV'").fetchone()
-    if not res:
-        conn.execute("INSERT INTO users (username, name, pin, raw_pin, role) VALUES (?, ?, ?, ?, ?)", 
-                     ("DEV", "Enrico Bottone", dev_pin_hash, dev_pin_raw, "sviluppatore"))
-    conn.commit()
-    conn.close()
 
-init_db()
 
-# --- INIZIALIZZAZIONE SESSION STATE ---
-if "logged_user" not in st.session_state:
-    st.session_state.logged_user = None
+REQUIRED_COLUMNS = {"id", "username", "password_hash", "salt", "role", "created_at"}
 
-if "current_step" not in st.session_state:
+
+def migrate_legacy_table() -> None:
+    """Se esiste una vecchia tabella 'users' con schema diverso, la mette da parte."""
+    with get_conn() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if cols and not REQUIRED_COLUMNS.issubset(cols):
+            conn.execute("DROP TABLE IF EXISTS users_legacy")
+            conn.execute("ALTER TABLE users RENAME TO users_legacy")
+
+
+def init_db() -> None:
+    migrate_legacy_table()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('sviluppatore', 'studente')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        exists = conn.execute(
+            "SELECT 1 FROM users WHERE username = 'DEV'"
+        ).fetchone()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                trace_path TEXT,
+                trace_sig TEXT,
+                current_step INTEGER NOT NULL DEFAULT 0,
+                scale TEXT
+            )
+            """
+        )
+    if not exists:
+        create_user("DEV", "sviluppatore@", ROLE_DEV)
+
+
+SESSION_HOURS = 12
+
+
+def create_session(user_id: int) -> str:
+    token = secrets.token_urlsafe(24)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at < datetime('now')")
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, expires_at) "
+            "VALUES (?, ?, datetime('now', ?))",
+            (token, user_id, f"+{SESSION_HOURS} hours"),
+        )
+    return token
+
+
+def load_session(token: str):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT s.trace_path, s.trace_sig, s.current_step, s.scale,
+                   u.id AS user_id, u.username, u.role
+            FROM sessions s JOIN users u ON u.id = s.user_id
+            WHERE s.token = ? AND s.expires_at > datetime('now')
+            """,
+            (token,),
+        ).fetchone()
+
+
+def save_session_state() -> None:
+    token = st.session_state.get("token")
+    if not token:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET trace_path = ?, trace_sig = ?, "
+            "current_step = ?, scale = ? WHERE token = ?",
+            (
+                st.session_state.get("trace_path"),
+                st.session_state.get("trace_sig"),
+                int(st.session_state.get("current_step", 0)),
+                st.session_state.get("scale"),
+                token,
+            ),
+        )
+
+
+def delete_session(token) -> None:
+    if not token:
+        return
+    with get_conn() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+
+def restore_login() -> None:
+    """Ripristina il login dopo una riconnessione (es. dopo la scelta della foto su mobile)."""
+    if st.session_state.user:
+        return
+    token = st.query_params.get("s")
+    if not token:
+        return
+    row = load_session(token)
+    if row is None:
+        st.query_params.clear()
+        return
+    st.session_state.user = {
+        "id": row["user_id"],
+        "username": row["username"],
+        "role": row["role"],
+    }
+    st.session_state.token = token
+    if row["trace_path"] and Path(row["trace_path"]).exists():
+        st.session_state.trace_path = row["trace_path"]
+        st.session_state.trace_sig = row["trace_sig"]
+    st.session_state.current_step = row["current_step"] or 0
+    st.session_state.scale = row["scale"] if row["scale"] in SCALES else "1:1"
+
+
+def authenticate(username: str, password: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username.strip(),)
+        ).fetchone()
+    if row is None:
+        return None
+    candidate = hash_password(password, row["salt"])
+    if hmac.compare_digest(candidate, row["password_hash"]):
+        return {"id": row["id"], "username": row["username"], "role": row["role"]}
+    return None
+
+
+def list_students():
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, username, created_at FROM users WHERE role = ? ORDER BY username",
+            (ROLE_STUDENT,),
+        ).fetchall()
+
+
+def delete_student(user_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM users WHERE id = ? AND role = ?", (user_id, ROLE_STUDENT)
+        )
+
+
+def reset_student_password(user_id: int, new_password: str) -> None:
+    salt = secrets.token_hex(16)
+    pwd_hash = hash_password(new_password, salt)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, salt = ? WHERE id = ? AND role = ?",
+            (pwd_hash, salt, user_id, ROLE_STUDENT),
+        )
+
+
+# ----------------------------------------------------------------------------
+# STILE (DARK MODE)
+# ----------------------------------------------------------------------------
+CSS = """
+<style>
+.stApp {
+    background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 55%, #0f172a 100%);
+    color: #e2e8f0;
+}
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0b1224 0%, #111c3a 100%);
+    border-right: 1px solid rgba(148, 163, 184, 0.15);
+}
+h1, h2, h3, h4 { color: #f8fafc !important; letter-spacing: 0.2px; }
+
+.hero {
+    background: linear-gradient(120deg, rgba(56,189,248,0.15), rgba(139,92,246,0.18));
+    border: 1px solid rgba(148, 163, 184, 0.25);
+    border-radius: 20px;
+    padding: 1.6rem 1.8rem;
+    margin-bottom: 1.4rem;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+.hero h1 { margin: 0 0 0.4rem 0; font-size: 2rem; }
+.hero p { margin: 0.2rem 0; color: #cbd5e1; font-size: 1rem; line-height: 1.5; }
+.hero .author {
+    display: inline-block; margin-top: 0.7rem; padding: 0.25rem 0.8rem;
+    border-radius: 999px; background: rgba(56,189,248,0.18);
+    color: #7dd3fc; font-weight: 600; font-size: 0.85rem; letter-spacing: 0.5px;
+}
+
+.card {
+    background: rgba(30, 41, 59, 0.75);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 16px;
+    padding: 1.2rem 1.4rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}
+.card h3 { margin-top: 0; color: #7dd3fc !important; }
+.card ul { margin: 0.4rem 0 0 1.1rem; }
+.card li { margin-bottom: 0.3rem; color: #e2e8f0; }
+.step-badge {
+    display: inline-block; padding: 0.15rem 0.7rem; border-radius: 999px;
+    background: rgba(139,92,246,0.25); color: #c4b5fd;
+    font-size: 0.8rem; font-weight: 600; margin-bottom: 0.5rem;
+}
+.tip {
+    border-left: 4px solid #38bdf8; background: rgba(56,189,248,0.08);
+    padding: 0.6rem 0.9rem; border-radius: 8px; margin-top: 0.7rem; color: #bae6fd;
+}
+
+.stButton > button, .stFormSubmitButton > button {
+    background: linear-gradient(90deg, #0ea5e9, #6366f1);
+    color: white; border: none; border-radius: 12px;
+    padding: 0.55rem 1.3rem; font-weight: 600;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.stButton > button:hover, .stFormSubmitButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(99, 102, 241, 0.45);
+    color: white; border: none;
+}
+.stButton > button:disabled {
+    background: #334155; color: #94a3b8; box-shadow: none; transform: none;
+}
+.stProgress > div > div > div > div {
+    background: linear-gradient(90deg, #38bdf8, #8b5cf6);
+}
+[data-testid="stFileUploader"] section {
+    background: rgba(30, 41, 59, 0.6);
+    border: 1.5px dashed rgba(125, 211, 252, 0.5);
+    border-radius: 14px;
+}
+.login-wrap { max-width: 460px; margin: 4vh auto 0 auto; }
+</style>
+"""
+
+
+def inject_css():
+    st.markdown(CSS, unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------------
+# STATO DI SESSIONE
+# ----------------------------------------------------------------------------
+def init_state():
+    defaults = {
+        "user": None,
+        "current_step": 0,
+        "trace_path": None,
+        "trace_sig": None,
+        "scale": "1:1",
+        "token": None,
+        "widget_gen": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def logout():
+    delete_session(st.session_state.get("token"))
+    st.query_params.clear()
+    path = st.session_state.get("trace_path")
+    if path and Path(path).exists():
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+    for key in ["user", "current_step", "trace_path", "trace_sig", "scale", "token"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+# ----------------------------------------------------------------------------
+# SCHERMATA DI LOGIN
+# ----------------------------------------------------------------------------
+def login_page():
+    st.markdown('<div class="login-wrap">', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="hero" style="text-align:center;">
+            <h1>📐 CAD Assistant</h1>
+            <p>Proiezioni Ortogonali</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Accedi")
+    if submitted:
+        user = authenticate(username, password)
+        if user:
+            token = create_session(user["id"])
+            st.session_state.user = user
+            st.session_state.token = token
+            st.query_params["s"] = token
+            st.rerun()
+        else:
+            st.error("Credenziali non valide.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------------
+# GESTIONE UTENTI (SOLO SVILUPPATORE)
+# ----------------------------------------------------------------------------
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,30}$")
+
+
+def user_management_page():
+    user = st.session_state.user
+    if not user or user["role"] != ROLE_DEV:
+        st.error("Accesso negato.")
+        return
+
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>👥 Gestione Utenti</h1>
+            <p>Crea e gestisci gli account con ruolo <b>studente</b>.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_new, tab_list = st.tabs(["➕ Nuovo studente", "📋 Elenco studenti"])
+
+    with tab_new:
+        with st.form("new_student_form", clear_on_submit=True):
+            new_user = st.text_input("Username studente")
+            new_pwd = st.text_input("Password", type="password")
+            new_pwd2 = st.text_input("Conferma password", type="password")
+            create = st.form_submit_button("Crea account studente")
+        if create:
+            if not USERNAME_RE.match(new_user or ""):
+                st.error("Username non valido: 3-30 caratteri (lettere, numeri, . _ -).")
+            elif len(new_pwd) < 6:
+                st.error("La password deve avere almeno 6 caratteri.")
+            elif new_pwd != new_pwd2:
+                st.error("Le password non coincidono.")
+            else:
+                try:
+                    create_user(new_user.strip(), new_pwd, ROLE_STUDENT)
+                    st.success(f"Account studente «{new_user.strip()}» creato.")
+                except sqlite3.IntegrityError:
+                    st.error("Esiste già un utente con questo username.")
+
+    with tab_list:
+        students = list_students()
+        if not students:
+            st.info("Nessuno studente registrato.")
+        for s in students:
+            with st.expander(f"🎓 {s['username']}  ·  creato il {s['created_at']}"):
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    pwd = st.text_input(
+                        "Nuova password",
+                        type="password",
+                        key=f"pwd_{s['id']}",
+                    )
+                    if st.button("Aggiorna password", key=f"upd_{s['id']}"):
+                        if len(pwd) < 6:
+                            st.error("Minimo 6 caratteri.")
+                        else:
+                            reset_student_password(s["id"], pwd)
+                            st.success("Password aggiornata.")
+                with c2:
+                    st.write("")
+                    st.write("")
+                    if st.button("Elimina", key=f"del_{s['id']}"):
+                        delete_student(s["id"])
+                        st.rerun()
+
+
+# ----------------------------------------------------------------------------
+# GUIDA PASSO-PASSO
+# ----------------------------------------------------------------------------
+def scale_factor(scale: str) -> float:
+    """'1:2' -> 0.5 ; '2:1' -> 2.0 (misura disegno = misura reale * fattore)."""
+    a, b = scale.split(":")
+    return float(a) / float(b)
+
+
+def build_steps(scale: str):
+    f = scale_factor(scale)
+    if scale == "1:1":
+        kind = "scala naturale: le misure sul foglio coincidono con quelle reali"
+    elif f < 1:
+        kind = "scala di riduzione: le misure sul foglio sono più piccole di quelle reali"
+    else:
+        kind = "scala di ingrandimento: le misure sul foglio sono più grandi di quelle reali"
+
+    return [
+        {
+            "title": "Analisi della traccia",
+            "items": [
+                "Osserva la traccia e individua la forma generale del solido o del pezzo.",
+                "Identifica fori, smussi, raccordi, gole e sporgenze.",
+                "Annota tutte le quote note e individua quelle che mancano.",
+                "Stabilisci quali elementi saranno visibili e quali nascosti nelle diverse viste.",
+            ],
+            "tip": "Una buona lettura della traccia evita errori nelle fasi successive.",
+        },
+        {
+            "title": "Scala e formato del foglio",
+            "items": [
+                f"Scala scelta: <b>{scale}</b> — {kind}.",
+                f"Formula: misura da disegnare = misura reale × <b>{f:g}</b>.",
+                "Scegli il formato (A4, A3…) in modo che le tre viste entrino con margini adeguati.",
+                "Traccia il riquadro (margini) e predisponi lo spazio per il cartiglio.",
+            ],
+            "tip": "Le quote scritte restano sempre quelle reali, indipendentemente dalla scala.",
+        },
+        {
+            "title": "Scelta della vista frontale",
+            "items": [
+                "La vista frontale (prospetto) è quella che descrive meglio la forma del pezzo.",
+                "Scegli la posizione di lavoro o d'uso più naturale del pezzo.",
+                "Mostra il maggior numero di particolari in vista (meno linee tratteggiate).",
+                "Il numero di viste deve essere il minimo necessario per definire completamente l'oggetto.",
+            ],
+            "tip": "Il pezzo deve essere definito completamente con il minor numero di viste.",
+        },
+        {
+            "title": "Disposizione delle viste (metodo europeo)",
+            "items": [
+                "Vista frontale in alto a sinistra del foglio.",
+                "Pianta (vista dall'alto) <b>sotto</b> la vista frontale.",
+                "Vista laterale sinistra <b>a destra</b> della vista frontale.",
+                "Lascia tra le viste uno spazio sufficiente per le quote.",
+            ],
+            "tip": "Nel metodo europeo (primo diedro) l'oggetto si trova fra l'osservatore e il piano di proiezione.",
+        },
+        {
+            "title": "Assi e linee di costruzione",
+            "items": [
+                "Traccia con linea sottile gli assi di simmetria (linea a tratto e punto).",
+                "Disegna le linee di costruzione leggere per gli ingombri massimi.",
+                "Prepara la bisettrice a 45° per riportare le misure tra pianta e vista laterale.",
+                "Usa matita dura (H/2H) per le linee di costruzione.",
+            ],
+            "tip": "Le linee di costruzione devono essere leggere: andranno rinforzate solo dove serve.",
+        },
+        {
+            "title": "Proiezione della vista frontale",
+            "items": [
+                "Riporta larghezza e altezza reali applicando la scala scelta.",
+                "Disegna il contorno esterno, poi i particolari interni (fori, smussi).",
+                "Evidenzia con linee di richiamo i punti notevoli da proiettare.",
+                "Verifica le proporzioni confrontando con la traccia.",
+            ],
+            "tip": "Lavora dal generale al particolare.",
+        },
+        {
+            "title": "Proiezione della pianta",
+            "items": [
+                "Proietta verso il basso, con linee verticali, i punti della vista frontale.",
+                "Riporta le profondità reali moltiplicate per il fattore di scala.",
+                "Disegna contorni e particolari visibili dall'alto.",
+                "Controlla che larghezze della pianta e del prospetto coincidano.",
+            ],
+            "tip": "Le larghezze devono corrispondere perfettamente nelle due viste.",
+        },
+        {
+            "title": "Proiezione della vista laterale",
+            "items": [
+                "Proietta orizzontalmente le altezze dalla vista frontale.",
+                "Riporta le profondità dalla pianta usando la bisettrice a 45°.",
+                "Disegna contorni e particolari della vista laterale sinistra.",
+                "Controlla che altezze e profondità siano coerenti con le altre viste.",
+            ],
+            "tip": "La bisettrice a 45° è lo strumento più rapido per trasferire le profondità.",
+        },
+        {
+            "title": "Tipi di linea e parti nascoste",
+            "items": [
+                "Contorni e spigoli in vista: linea continua grossa.",
+                "Spigoli nascosti: linea tratteggiata sottile.",
+                "Assi e centri: linea a tratto e punto sottile.",
+                "Rinforza i contorni definitivi e cancella le costruzioni superflue.",
+            ],
+            "tip": "Rispetta le norme UNI/ISO sui tipi e gli spessori di linea.",
+        },
+        {
+            "title": "Quotatura",
+            "items": [
+                "Quota ogni elemento una sola volta, nella vista dove è più chiaro.",
+                "Linee di misura sottili, frecce ben formate, numeri leggibili.",
+                "Scrivi le quote reali (non quelle scalate).",
+                "Evita quote ridondanti e non quotare sulle linee nascoste.",
+            ],
+            "tip": "Le quote devono permettere di realizzare il pezzo senza fare misurazioni sul disegno.",
+        },
+        {
+            "title": "Cartiglio e verifica finale",
+            "items": [
+                "Compila il cartiglio: titolo, scala, data, nome, classe, metodo di proiezione.",
+                f"Indica nel cartiglio la scala <b>{scale}</b> e il simbolo del metodo europeo.",
+                "Controlla coerenza tra le viste, quote complete, linee corrette.",
+                "Ripulisci il foglio e consegna l'elaborato.",
+            ],
+            "tip": "Una verifica finale accurata fa la differenza nella valutazione.",
+        },
+    ]
+
+
+def go_prev():
+    if st.session_state.current_step > 0:
+        st.session_state.current_step -= 1
+
+
+def go_next(total: int):
+    if st.session_state.current_step < total - 1:
+        st.session_state.current_step += 1
+
+
+def save_upload(uploaded) -> None:
+    """Salva il file su disco con getbuffer() e memorizza solo il percorso."""
+    size_mb = uploaded.size / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        st.error(f"File troppo grande ({size_mb:.1f} MB). Limite: {MAX_UPLOAD_MB} MB.")
+        return
+
+    ext = Path(uploaded.name).suffix.lower()
+    if ext.lstrip(".") not in ALLOWED_EXT:
+        st.error("Formato non supportato.")
+        return
+
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
+    with open(dest, "wb") as f:
+        f.write(uploaded.getbuffer())
+
+    # Verifica che sia davvero un'immagine valida (senza caricarla tutta in memoria)
+    try:
+        with Image.open(dest) as img:
+            img.verify()
+    except Exception:
+        dest.unlink(missing_ok=True)
+        st.error("Il file caricato non è un'immagine valida.")
+        return
+
+    # Elimina la traccia precedente
+    old = st.session_state.get("trace_path")
+    if old and Path(old).exists():
+        try:
+            Path(old).unlink()
+        except OSError:
+            pass
+
+    st.session_state.trace_path = str(dest)
+    st.session_state.trace_sig = f"{uploaded.name}-{uploaded.size}"
     st.session_state.current_step = 0
 
-if "uploaded_image_path" not in st.session_state:
-    st.session_state.uploaded_image_path = None
 
-if "scala_scelta" not in st.session_state:
-    st.session_state.scala_scelta = "1:1"
+def remove_trace():
+    old = st.session_state.get("trace_path")
+    if old and Path(old).exists():
+        try:
+            Path(old).unlink()
+        except OSError:
+            pass
+    st.session_state.trace_path = None
+    st.session_state.trace_sig = None
+    st.session_state.current_step = 0
+    st.session_state.widget_gen += 1
 
-# --- SCHERMATA DI LOGIN ---
-if not st.session_state.logged_user:
-    st.markdown("<h2 style='text-align: center; margin-bottom: 25px;'>📐 CAD ASSISTANT — ACCESSO</h2>", unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns([1, 1.2, 1])
-    with col2:
-        with st.form("login_form"):
-            st.markdown("<h3 style='text-align: center; color: #38bdf8;'>Area Riservata</h3>", unsafe_allow_html=True)
-            username_input = st.text_input("Nome Utente").strip()
-            password_input = st.text_input("Password", type="password")
-            
-            submit_login = st.form_submit_button("Accedi al Sistema")
-            
-            if submit_login:
-                conn = sqlite3.connect("cad_users.db", check_same_thread=False)
-                user_record = conn.execute("SELECT name, pin, role FROM users WHERE username = ?", (username_input,)).fetchone()
-                conn.close()
-                
-                hashed_input = hashlib.sha256(password_input.encode()).hexdigest()
-                
-                if user_record and user_record[1] == hashed_input:
-                    st.session_state.logged_user = {
-                        "username": username_input,
-                        "name": user_record[0],
-                        "role": user_record[2]
-                    }
-                    st.success(f"Accesso riuscito! Benvenuto, {user_record[0]}")
-                    st.rerun()
+
+# ----------------------------------------------------------------------------
+# MODELLO 3D DEL SOLIDO E PROIEZIONI (metodo europeo, 1° diedro)
+# ----------------------------------------------------------------------------
+# Il solido e' descritto come unione (op "add") meno sottrazioni (op "sub") di parti:
+#   box       {"op","tipo":"box","x":[x0,x1],"y":[y0,y1],"z":[z0,z1]}
+#   prisma    {"op","tipo":"prisma","asse":"z|x|y","profilo":[[a,b],...],"da":t0,"a":t1}
+#   cilindro  {"op","tipo":"cilindro","asse":"z|x|y","centro":[a,b],"raggio":r,"da":t0,"a":t1}
+# Assi: x = larghezza (sinistra->destra in vista frontale), y = altezza (basso->alto),
+#       z = profondita' (z=0 faccia frontale, cresce verso il fondo).
+# Coordinate del profilo/centro: asse z -> (x,y); asse x -> (y,z); asse y -> (x,z).
+SHEETS = {"A4": (297, 210), "A3": (420, 297), "A2": (594, 420)}
+
+LINE_STYLES = {
+    "v": 'stroke="#111827" stroke-width="0.6" stroke-linecap="round"',
+    "t": 'stroke="#6b7280" stroke-width="0.2"',
+    "h": 'stroke="#111827" stroke-width="0.35" stroke-dasharray="3 1.5"',
+    "a": 'stroke="#374151" stroke-width="0.25" stroke-dasharray="9 1.5 1.5 1.5"',
+}
+
+AX = {"x": 0, "y": 1, "z": 2}
+CYL_FACETS = 48          # multiplo di 4
+MAX_PARTS = 40
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+
+GEMINI_PROMPT = """Sei un esperto di disegno tecnico. L'immagine mostra l'esercizio di un libro di disegno
+(di solito un solido in assonometria o prospettiva con le quote, a volte con le viste).
+Ricostruisci il solido in 3D e restituisci SOLO un oggetto JSON (nessun testo fuori dal JSON).
+
+Sistema di assi (millimetri): x = larghezza (da sinistra a destra nella vista frontale),
+y = altezza (dal basso verso l'alto), z = profondita' (z=0 e' la faccia frontale, z cresce verso il fondo).
+Scegli come vista frontale la faccia piu' significativa del solido.
+
+Il solido e' l'unione delle parti con "op":"add" meno le parti con "op":"sub" (fori, scassi, gole).
+Tipi di parte:
+- {"op":"add","tipo":"box","x":[x0,x1],"y":[y0,y1],"z":[z0,z1]}
+- {"op":"add","tipo":"prisma","asse":"z","profilo":[[a,b],...],"da":t0,"a":t1}
+  poligono estruso lungo l'asse indicato; coordinate del profilo: asse z -> [x,y]; asse x -> [y,z]; asse y -> [x,z].
+  Serve per esagoni, triangoli, trapezi, smussi, cunei. Calcola tu le coordinate esatte (2 decimali).
+- {"op":"add","tipo":"cilindro","asse":"z","centro":[a,b],"raggio":r,"da":t0,"a":t1}
+  centro: asse z -> [x,y]; asse x -> [y,z]; asse y -> [x,z].
+Regole: i fori/scassi ("sub") devono sporgere di 1 mm oltre le facce che attraversano se sono passanti.
+Usa le quote scritte sull'esercizio; se una quota manca, stimala dalle proporzioni. Il solido puo' essere
+composto da piu' parti "add" che si toccano o si sovrappongono.
+
+Formato di risposta:
+{"titolo":"Esercitazione N","scala":"1:1","descrizione":"breve descrizione in italiano",
+ "parti":[ ... ]}
+("scala" e' quella indicata nel testo dell'esercizio, oppure null.)
+
+Esempio: parallelepipedo 40x20x30 con foro cilindrico passante di diametro 10 lungo z al centro:
+{"titolo":"Esempio","scala":null,"descrizione":"Blocco con foro","parti":[
+ {"op":"add","tipo":"box","x":[0,40],"y":[0,20],"z":[0,30]},
+ {"op":"sub","tipo":"cilindro","asse":"z","centro":[20,10],"raggio":5,"da":-1,"a":31}]}"""
+
+
+def example_14_json():
+    """Esercitazione 14: prisma esagonale regolare (lato 24) con foro quadrato 18 passante, profondita' 20."""
+    L = 24.0
+    ah = L * math.sqrt(3) / 2
+    cx, cy = L, ah
+    prof = [
+        [cx + L, cy], [cx + L / 2, cy + ah], [cx - L / 2, cy + ah],
+        [cx - L, cy], [cx - L / 2, cy - ah], [cx + L / 2, cy - ah],
+    ]
+    prof = [[round(a, 3), round(b, 3)] for a, b in prof]
+    q = 9.0
+    data = {
+        "titolo": "Esercitazione 14",
+        "scala": "1:1",
+        "descrizione": "Prisma esagonale regolare (lato 24) con foro quadrato passante 18x18, profondità 20.",
+        "parti": [
+            {"op": "add", "tipo": "prisma", "asse": "z", "profilo": prof, "da": 0, "a": 20},
+            {"op": "sub", "tipo": "box", "x": [cx - q, cx + q], "y": [round(cy - q, 3), round(cy + q, 3)], "z": [-1, 21]},
+        ],
+    }
+    return json.dumps(data, ensure_ascii=False, indent=1)
+
+
+# ---------------------------- Geometria di base ------------------------------
+def _perp(axis):
+    return {"z": (0, 1), "x": (1, 2), "y": (0, 2)}[axis]
+
+
+def _cross2(o, a, b):
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _poly_ccw(poly):
+    n = len(poly)
+    area = sum(poly[i][0] * poly[(i + 1) % n][1] - poly[(i + 1) % n][0] * poly[i][1] for i in range(n))
+    return poly if area > 0 else poly[::-1]
+
+
+def _is_convex(poly):
+    n = len(poly)
+    return all(_cross2(poly[i], poly[(i + 1) % n], poly[(i + 2) % n]) >= -1e-9 for i in range(n))
+
+
+def _in_tri(p, a, b, c):
+    return _cross2(a, b, p) >= -1e-9 and _cross2(b, c, p) >= -1e-9 and _cross2(c, a, p) >= -1e-9
+
+
+def _triangulate(poly):
+    """Ear clipping: scompone un poligono (CCW) in triangoli, che sono sempre convessi."""
+    idx = list(range(len(poly)))
+    tris = []
+    guard = 0
+    while len(idx) > 3 and guard < 2000:
+        guard += 1
+        found = False
+        for k in range(len(idx)):
+            i0, i1, i2 = idx[k - 1], idx[k], idx[(k + 1) % len(idx)]
+            a, b, c = poly[i0], poly[i1], poly[i2]
+            if _cross2(a, b, c) <= 1e-9:
+                continue
+            if any(_in_tri(poly[j], a, b, c) for j in idx if j not in (i0, i1, i2)):
+                continue
+            tris.append([a, b, c])
+            idx.pop(k)
+            found = True
+            break
+        if not found:
+            raise ValueError("profilo non valido (lati che si incrociano?)")
+    tris.append([poly[i] for i in idx])
+    return tris
+
+
+def _piece(poly, axis, t0, t1, cid=None):
+    """Poligono convesso CCW, nel piano perpendicolare a 'axis', esteso da t0 a t1."""
+    ia, ib = _perp(axis)
+    ax = AX[axis]
+    n = len(poly)
+    A, d, tags, verts = [], [], [], []
+    for k in range(n):
+        p, q = poly[k], poly[(k + 1) % n]
+        ex, ey = q[0] - p[0], q[1] - p[1]
+        length = math.hypot(ex, ey)
+        if length < 1e-9:
+            continue
+        n2 = (ey / length, -ex / length)
+        v = [0.0, 0.0, 0.0]
+        v[ia], v[ib] = n2
+        A.append(v)
+        d.append(n2[0] * p[0] + n2[1] * p[1])
+        tags.append((cid, k, n) if cid is not None else None)
+    for sgn, t in ((1.0, t1), (-1.0, -t0)):
+        v = [0.0, 0.0, 0.0]
+        v[ax] = sgn
+        A.append(v)
+        d.append(t)
+        tags.append(None)
+    for p in poly:
+        for t in (t0, t1):
+            q = [0.0, 0.0, 0.0]
+            q[ia], q[ib], q[ax] = p[0], p[1], t
+            verts.append(q)
+    return np.array(A), np.array(d), tags, np.array(verts)
+
+
+def _num(v, what):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"valore non numerico in {what}")
+
+
+def _parts_to_pieces(data, shift):
+    parts = data.get("parti")
+    if not isinstance(parts, list) or not parts:
+        raise ValueError("manca l'elenco 'parti'")
+    if len(parts) > MAX_PARTS:
+        raise ValueError(f"troppe parti (massimo {MAX_PARTS})")
+    pieces, cyls = [], []
+    cid = 0
+    for p in parts:
+        op = p.get("op", "add")
+        if op not in ("add", "sub"):
+            raise ValueError("'op' deve essere add o sub")
+        tipo = p.get("tipo")
+        shapes = []
+        if tipo == "box":
+            x0, x1 = sorted(_num(v, "box.x") for v in p["x"])
+            y0, y1 = sorted(_num(v, "box.y") for v in p["y"])
+            z0, z1 = sorted(_num(v, "box.z") for v in p["z"])
+            sx, sy, sz = shift
+            poly = [[x0 - sx, y0 - sy], [x1 - sx, y0 - sy], [x1 - sx, y1 - sy], [x0 - sx, y1 - sy]]
+            shapes.append((poly, "z", z0 - sz, z1 - sz, None))
+        elif tipo == "prisma":
+            axis = p.get("asse", "z")
+            if axis not in AX:
+                raise ValueError("'asse' deve essere x, y o z")
+            ia, ib = _perp(axis)
+            ax = AX[axis]
+            prof = p["profilo"]
+            if len(prof) < 3:
+                raise ValueError("il profilo ha meno di 3 punti")
+            poly = [[_num(a, "profilo") - shift[ia], _num(b, "profilo") - shift[ib]] for a, b in prof]
+            t0, t1 = sorted((_num(p["da"], "da") - shift[ax], _num(p["a"], "a") - shift[ax]))
+            poly = _poly_ccw(poly)
+            for sub_poly in ([poly] if _is_convex(poly) else _triangulate(poly)):
+                shapes.append((sub_poly, axis, t0, t1, None))
+        elif tipo == "cilindro":
+            axis = p.get("asse", "z")
+            if axis not in AX:
+                raise ValueError("'asse' deve essere x, y o z")
+            ia, ib = _perp(axis)
+            ax = AX[axis]
+            ca = _num(p["centro"][0], "centro") - shift[ia]
+            cb = _num(p["centro"][1], "centro") - shift[ib]
+            r = _num(p["raggio"], "raggio")
+            if r <= 0:
+                raise ValueError("raggio non valido")
+            t0, t1 = sorted((_num(p["da"], "da") - shift[ax], _num(p["a"], "a") - shift[ax]))
+            cid += 1
+            poly = [
+                [ca + r * math.cos(2 * math.pi * k / CYL_FACETS), cb + r * math.sin(2 * math.pi * k / CYL_FACETS)]
+                for k in range(CYL_FACETS)
+            ]
+            shapes.append((poly, axis, t0, t1, cid))
+            cyls.append((axis, ca, cb, r, t0, t1))
+        else:
+            raise ValueError(f"tipo di parte sconosciuto: {tipo}")
+        for poly, axis, t0, t1, c in shapes:
+            pieces.append((op,) + _piece(poly, axis, t0, t1, c))
+    return pieces, cyls
+
+
+def _contains(P, add, sub):
+    """Punti interni al solido: unione delle parti 'add' (interno stretto) meno le 'sub' (chiuse)."""
+    ins = np.zeros(len(P), bool)
+    for A, d in add:
+        ins |= ((P @ A.T - d[None, :]) < -1e-9).all(axis=1)
+    for A, d in sub:
+        ins &= ~((P @ A.T - d[None, :]) <= 1e-9).all(axis=1)
+    return ins
+
+
+def _hidden(P, dirv, add, sub):
+    """True per i punti P nascosti da materiale lungo il raggio verso l'osservatore (direzione dirv)."""
+    EPS = 1e-3
+    N = len(P)
+    B = [np.full(N, EPS)]
+    for A, d in add + sub:
+        a = A @ dirv
+        c = d[None, :] - P @ A.T
+        lo = np.full(N, -np.inf)
+        hi = np.full(N, np.inf)
+        bad = np.zeros(N, bool)
+        for k in range(len(a)):
+            if abs(a[k]) < 1e-9:
+                bad |= c[:, k] < -1e-9
+            elif a[k] > 0:
+                hi = np.minimum(hi, c[:, k] / a[k])
+            else:
+                lo = np.maximum(lo, c[:, k] / a[k])
+        lo = np.maximum(lo, EPS)
+        ok = (~bad) & (hi > lo)
+        B.append(np.where(ok, lo, EPS))
+        B.append(np.where(ok, np.maximum(hi, EPS), EPS))
+    B = np.sort(np.stack(B, axis=1), axis=1)
+    mids = (B[:, :-1] + B[:, 1:]) / 2
+    width = B[:, 1:] - B[:, :-1]
+    pts = P[:, None, :] + mids[:, :, None] * dirv[None, None, :]
+    occ = _contains(pts.reshape(-1, 3), add, sub).reshape(mids.shape)
+    return (occ & (width > 1e-6)).any(axis=1)
+
+
+def _hidden4(P, dirv, add, sub, delta=0.02):
+    """Nascosto solo se bloccati tutti e 4 i raggi leggermente spostati (evita errori sulle facce parallele alla vista)."""
+    k = int(np.argmax(np.abs(dirv)))
+    e1, e2 = [np.eye(3)[i] for i in range(3) if i != k]
+    res = np.ones(len(P), bool)
+    for s1 in (1.0, -1.0):
+        for s2 in (1.0, -1.0):
+            res &= _hidden(P + delta * (s1 * e1 + s2 * e2), dirv, add, sub)
+    return res
+
+
+def _snap(t, cand, tol):
+    if cand.size:
+        k = int(np.argmin(np.abs(cand - t)))
+        if abs(cand[k] - t) <= tol:
+            return float(cand[k])
+    return t
+
+
+def _merge(segs):
+    """Unisce i segmenti collineari che si sovrappongono o si toccano."""
+    groups = {}
+    for (x1, y1), (x2, y2) in segs:
+        dx, dy = x2 - x1, y2 - y1
+        if math.hypot(dx, dy) < 1e-6:
+            continue
+        ang = math.atan2(dy, dx) % math.pi
+        if ang > math.pi - 1e-6:
+            ang = 0.0
+        c, s_ = math.cos(ang), math.sin(ang)
+        rho = -s_ * x1 + c * y1
+        t1, t2 = c * x1 + s_ * y1, c * x2 + s_ * y2
+        groups.setdefault((round(ang, 3), round(rho, 2)), []).append((min(t1, t2), max(t1, t2), ang, rho))
+    out = []
+    for iv in groups.values():
+        iv.sort()
+        ang, rho = iv[0][2], iv[0][3]
+        c, s_ = math.cos(ang), math.sin(ang)
+        cur = [iv[0][0], iv[0][1]]
+        merged = []
+        for a, b, _, _ in iv[1:]:
+            if a <= cur[1] + 0.3:
+                cur[1] = max(cur[1], b)
+            else:
+                merged.append(tuple(cur))
+                cur = [a, b]
+        merged.append(tuple(cur))
+        for a, b in merged:
+            out.append(((a * c - rho * s_, a * s_ + rho * c), (b * c - rho * s_, b * s_ + rho * c)))
+    return out
+
+
+VIEWS = {  # direzione verso l'osservatore, assi 3D mostrati (orizzontale, verticale), asse eliminato
+    "front": (np.array([0.0, 0.0, -1.0]), (0, 1), 2),
+    "top": (np.array([0.0, 1.0, 0.0]), (0, 2), 1),
+    "left": (np.array([-1.0, 0.0, 0.0]), (2, 1), 0),
+}
+
+
+def _axis_lines(cyls, dims, vi, ia, ib):
+    segs = []
+    for axis, ca, cb, r, t0, t1 in cyls:
+        ax = AX[axis]
+        pa, pb = _perp(axis)
+        c = [0.0, 0.0, 0.0]
+        c[pa], c[pb] = ca, cb
+        if ax == vi:
+            for k in (pa, pb):
+                p, q = list(c), list(c)
+                p[k] -= r + 3
+                q[k] += r + 3
+                segs.append(((p[ia], p[ib]), (q[ia], q[ib])))
+        else:
+            p, q = list(c), list(c)
+            p[ax] = max(t0, 0.0) - 3
+            q[ax] = min(t1, dims[ax]) + 3
+            segs.append(((p[ia], p[ib]), (q[ia], q[ib])))
+    return segs
+
+
+@st.cache_data(show_spinner=False)
+def compute_solid(json_text):
+    """Calcola gli spigoli (in vista e nascosti) delle tre viste di un solido descritto in JSON."""
+    data = json.loads(json_text)
+    if not isinstance(data, dict):
+        raise ValueError("il JSON deve essere un oggetto")
+    raw, _ = _parts_to_pieces(data, [0.0, 0.0, 0.0])
+    addv = [p[4] for p in raw if p[0] == "add"]
+    if not addv:
+        raise ValueError("serve almeno una parte con op 'add'")
+    allv = np.vstack(addv)
+    mn, mx = allv.min(axis=0), allv.max(axis=0)
+    dims = tuple(float(v) for v in (mx - mn))
+    if min(dims) < 1e-6:
+        raise ValueError("il solido ha una dimensione nulla")
+    pieces, cyls = _parts_to_pieces(data, list(mn))
+    add = [(p[1], p[2]) for p in pieces if p[0] == "add"]
+    sub = [(p[1], p[2]) for p in pieces if p[0] == "sub"]
+
+    # piani unici
+    planes = {}
+    for _op, A, d, tags, _v in pieces:
+        for n_, d_, tag in zip(A, d, tags):
+            n_ = np.array(n_, float)
+            dd = float(d_)
+            first = n_[np.nonzero(np.abs(n_) > 1e-9)[0][0]]
+            if first < 0:
+                n_, dd = -n_, -dd
+            key = (tuple(np.round(n_, 5)), round(dd, 3))
+            if key not in planes:
+                planes[key] = (n_, dd, tag)
+    PN = np.array([v[0] for v in planes.values()])
+    PD = np.array([v[1] for v in planes.values()])
+    PT = [v[2] for v in planes.values()]
+
+    lo = np.full(3, -0.5)
+    hi = np.array(dims) + 0.5
+    step, eps = 0.25, 0.02
+    sa, sb, run_pts, run_curve = [], [], [], []
+    n = len(PN)
+    for i in range(n):
+        for j in range(i + 1, n):
+            ni, nj = PN[i], PN[j]
+            u = np.cross(ni, nj)
+            nu = np.linalg.norm(u)
+            if nu < 1e-6:
+                continue
+            ti, tj = PT[i], PT[j]
+            curve = ti is not None or tj is not None
+            if ti is not None and tj is not None:
+                if ti[0] != tj[0]:
+                    continue
+                nf, ki, kj = ti[2], ti[1], tj[1]
+                if (kj - ki) % nf == 1:
+                    vtx = kj
+                elif (ki - kj) % nf == 1:
+                    vtx = ki
                 else:
-                    st.error("Nome utente o password errati.")
-    st.stop()
-
-user = st.session_state.logged_user
-
-# --- BARRA LATERALE E MENU ---
-st.sidebar.markdown(f"""
-    <div style='background: rgba(30, 41, 59, 0.5); padding: 14px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.06); margin-bottom: 20px;'>
-        <div style='font-size: 0.75rem; color: #38bdf8; font-weight: 600; text-transform: uppercase;'>Utente Connesso</div>
-        <div style='font-size: 1.05rem; font-weight: 700; color: #f8fafc; margin-top: 2px;'>{user['name']}</div>
-        <div style='font-size: 0.85rem; color: #94a3b8;'>Ruolo: {user['role'].upper()}</div>
-    </div>
-""", unsafe_allow_html=True)
-
-menu_options = ["📐 Area Disegno & Guida"]
-if user["role"] == "sviluppatore":
-    menu_options.append("👥 Gestione Utenti")
-
-selected_page = st.sidebar.radio("Navigazione", menu_options)
-
-st.sidebar.markdown("---")
-if st.sidebar.button("🔒 Effettua il Logout", use_container_width=True):
-    st.session_state.logged_user = None
-    st.rerun()
-
-# --- PAGINA 1: AREA DISEGNO & GUIDA ---
-if selected_page == "📐 Area Disegno & Guida":
-    st.title("📐 CAD Assistant — Proiezioni Ortogonali")
-    st.markdown("""
-    **A cosa serve il sistema:** Questo software è un assistente intelligente progettato per supportare passo-passo nell'esecuzione di disegni tecnici e proiezioni ortogonali di qualsiasi solido o esercitazione, guidando l'utente attraverso indicazioni visive e strutturate.
-    """)
-    st.markdown("👨‍💻 **Creato da: ENRICO BOTTONE**")
-    st.markdown("---")
-
-    col_upload, col_settings = st.columns(2)
-
-    with col_upload:
-        st.subheader("📸 1. Carica Traccia")
-        uploaded_file = st.file_uploader("Seleziona o scatta la foto della traccia", type=["jpg", "jpeg", "png", "webp"])
-        
-        if uploaded_file is not None:
-            os.makedirs("uploads", exist_ok=True)
-            image_path = f"uploads/traccia_{user['username']}.jpg"
-            with open(image_path, "wb") as f_foto:
-                f_foto.write(uploaded_file.getbuffer())
-            st.session_state.uploaded_image_path = image_path
-
-    with col_settings:
-        st.subheader("⚙️ 2. Imposta Scala")
-        st.session_state.scala_scelta = st.selectbox(
-            "Seleziona la Scala di Rappresentazione", 
-            ["1:1", "1:2", "2:1", "1:5", "5:1", "1:10"],
-            index=0
-        )
-        st.markdown(f"**Scala attiva:** `{st.session_state.scala_scelta}`")
-
-    st.markdown("---")
-    st.subheader("🧭 3. Guida Passo-Passo Interattiva e Risultato Completo")
-
-    # Due colonne: a sinistra la traccia caricata, a destra il disegno completo con quote e proiezioni
-    col_img, col_result = st.columns(1)
-    
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        st.markdown("### 📄 Traccia di Riferimento")
-        if st.session_state.uploaded_image_path and os.path.exists(st.session_state.uploaded_image_path):
+                    continue
+                if vtx % (nf // 4) != 0:
+                    continue
+            elif abs(float(ni @ nj)) > 0.94:
+                continue
+            u = u / nu
             try:
-                st.image(st.session_state.uploaded_image_path, caption="Traccia caricata dall'utente", use_container_width=True)
+                p0 = np.linalg.solve(np.array([ni, nj, u]), np.array([PD[i], PD[j], 0.0]))
+            except np.linalg.LinAlgError:
+                continue
+            t0, t1, ok = -1e9, 1e9, True
+            for k in range(3):
+                if abs(u[k]) < 1e-9:
+                    if p0[k] < lo[k] or p0[k] > hi[k]:
+                        ok = False
+                        break
+                else:
+                    a_, b_ = (lo[k] - p0[k]) / u[k], (hi[k] - p0[k]) / u[k]
+                    t0, t1 = max(t0, min(a_, b_)), min(t1, max(a_, b_))
+            if not ok or t1 - t0 < 1e-3:
+                continue
+            m = max(1, int(math.ceil((t1 - t0) / step)))
+            ts = t0 + np.arange(m + 1) * (t1 - t0) / m
+            P = p0[None, :] + ts[:, None] * u[None, :]
+            v1 = np.cross(u, ni)
+            v1 /= np.linalg.norm(v1)
+            v2 = np.cross(u, nj)
+            v2 /= np.linalg.norm(v2)
+            S = len(P)
+            Q = np.vstack([P + eps * (v1 + v2), P + eps * (v1 - v2), P + eps * (-v1 - v2), P + eps * (-v1 + v2)])
+            b = _contains(Q, add, sub).reshape(4, S)
+            pp, pm, mm, mp = b
+            cnt = pp.astype(int) + pm + mm + mp
+            diag = (pp & mm & ~pm & ~mp) | (pm & mp & ~pp & ~mm)
+            mask = (cnt == 1) | (cnt == 3) | diag
+            idx = np.nonzero(mask)[0]
+            if idx.size == 0:
+                continue
+            runs = np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1)
+            den = PN @ u
+            valid = np.abs(den) > 1e-6
+            cand = ((PD - PN @ p0)[valid]) / den[valid]
+            half = 0.5 * (ts[1] - ts[0])
+            for r in runs:
+                ta = _snap(ts[r[0]] - half, cand, 0.2)
+                tb = _snap(ts[r[-1]] + half, cand, 0.2)
+                if tb - ta < 1e-3:
+                    continue
+                mm_ = max(1, int(math.ceil((tb - ta) / 0.5)))
+                tt = np.linspace(ta, tb, mm_ + 1)
+                pts = p0[None, :] + tt[:, None] * u[None, :]
+                sa.append(pts[:-1])
+                sb.append(pts[1:])
+                run_pts.append((pts[0], pts[-1]))
+                run_curve.append(curve)
+    if not sa:
+        raise ValueError("nessuno spigolo trovato: controlla la descrizione del solido")
+    SA, SB = np.vstack(sa), np.vstack(sb)
+    MID = (SA + SB) / 2
+
+    views = {}
+    for name, (dirv, (ia, ib), vi) in VIEWS.items():
+        hid = np.concatenate([_hidden4(MID[k:k + 3000], dirv, add, sub) for k in range(0, len(MID), 3000)])
+        vis_s, hid_s = [], []
+        for a, b2, h in zip(SA, SB, hid):
+            seg = ((float(a[ia]), float(a[ib])), (float(b2[ia]), float(b2[ib])))
+            (hid_s if h else vis_s).append(seg)
+        pts = set()
+        for (pa_, pb_), curve in zip(run_pts, run_curve):
+            if not curve:
+                for q in (pa_, pb_):
+                    pts.add((round(float(q[ia]), 2), round(float(q[ib]), 2)))
+        views[name] = {
+            "v": _merge(vis_s),
+            "h": _merge(hid_s),
+            "a": _merge(_axis_lines(cyls, dims, vi, ia, ib)),
+            "pts": sorted(pts),
+        }
+    return {
+        "dims": dims,
+        "views": views,
+        "titolo": str(data.get("titolo") or "Esercitazione"),
+        "scala": data.get("scala"),
+        "descrizione": str(data.get("descrizione") or ""),
+    }
+
+
+# ------------------------------ Disegno SVG ----------------------------------
+def build_projection_svg(solid, scale_txt, sheet, title):
+    s = scale_factor(scale_txt)
+    Wd, Hd, Dd = (v * s for v in solid["dims"])
+    A_P, B_P, G_P = 25.0, 25.0, 25.0     # distanze sul foglio (mm)
+    M, TB_W, TB_H = 10, 150, 26
+
+    xmin, xmax = -(G_P + Wd), B_P + Dd
+    zmax, zmin = A_P + Hd, -(B_P + Dd)
+    dw, dh = xmax - xmin, zmax - zmin
+
+    def fits_on(sh):
+        w_, h_ = SHEETS[sh]
+        return dw <= (w_ - 2 * M) - 20 and dh <= (h_ - 2 * M - (TB_H + 4)) - 10
+
+    if sheet == "Auto":
+        sheet = next((sh for sh in ("A4", "A3", "A2") if fits_on(sh)), "A2")
+    fits = fits_on(sheet)
+    W, H = SHEETS[sheet]
+    area_w, area_h = W - 2 * M, H - 2 * M - (TB_H + 4)
+    ox = M + (area_w - dw) / 2 - xmin
+    oy = M + (area_h - dh) / 2 + zmax
+
+    def X(x):
+        return ox + x
+
+    def Y(z):
+        return oy - z
+
+    # trasformazioni dalle coordinate naturali di ogni vista alle coordinate del foglio (y verso l'alto)
+    def f_front(p):
+        return p[0] * s - (G_P + Wd), A_P + p[1] * s
+
+    def f_top(p):
+        return p[0] * s - (G_P + Wd), p[1] * s - (B_P + Dd)
+
+    def f_left(p):
+        return B_P + Dd - p[0] * s, A_P + p[1] * s
+
+    maps = {"front": f_front, "top": f_top, "left": f_left}
+
+    parts = []
+
+    def ln(p, q, k):
+        parts.append(
+            f'<line x1="{X(p[0]):.2f}" y1="{Y(p[1]):.2f}" x2="{X(q[0]):.2f}" y2="{Y(q[1]):.2f}" {LINE_STYLES[k]}/>'
+        )
+
+    def txt(x, y, t, size=5, anchor="start", bold=False):
+        w = ' font-weight="bold"' if bold else ""
+        parts.append(
+            f'<text x="{x:.2f}" y="{y:.2f}" font-size="{size}" font-family="Arial, Helvetica, sans-serif" '
+            f'fill="#111827" text-anchor="{anchor}"{w}>{escape(t)}</text>'
+        )
+
+    parts.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
+    parts.append(
+        f'<rect x="{M}" y="{M}" width="{W - 2 * M}" height="{H - 2 * M}" fill="none" stroke="#111827" stroke-width="0.7"/>'
+    )
+    parts.append(f'<line x1="{M}" y1="{Y(0):.2f}" x2="{W - M}" y2="{Y(0):.2f}" {LINE_STYLES["t"]}/>')
+    parts.append(f'<line x1="{X(0):.2f}" y1="{M}" x2="{X(0):.2f}" y2="{H - M}" {LINE_STYLES["t"]}/>')
+    tb = B_P + Dd + 8
+    ln((0, 0), (tb, -tb), "t")  # bisettrice
+
+    views = solid["views"]
+    # linee di proiezione (sottili), solo negli spazi tra le viste
+    xs = sorted({round(f_front(p)[0], 2) for p in views["front"]["pts"]})
+    for x in xs:
+        ln((x, A_P), (x, -B_P), "t")
+    zs = sorted({round(f_front(p)[1], 2) for p in views["front"]["pts"]})
+    for z in zs:
+        ln((-G_P, z), (B_P, z), "t")
+    vs = sorted({round(f_top(p)[1], 2) for p in views["top"]["pts"]})
+    for v in vs:
+        ln((-G_P, v), (-v, v), "t")
+        ln((-v, v), (-v, A_P), "t")
+
+    for name in ("front", "top", "left"):
+        f = maps[name]
+        for p, q in views[name]["a"]:
+            ln(f(p), f(q), "a")
+    for name in ("front", "top", "left"):
+        f = maps[name]
+        for p, q in views[name]["h"]:
+            ln(f(p), f(q), "h")
+    for name in ("front", "top", "left"):
+        f = maps[name]
+        for p, q in views[name]["v"]:
+            ln(f(p), f(q), "v")
+
+    txt(M + 4, M + 9, "P.V.", 6, bold=True)
+    txt(W - M - 4, M + 9, "P.L.", 6, anchor="end", bold=True)
+    txt(M + 4, H - M - 5, "P.O.", 6, bold=True)
+    txt(W - M - 3, Y(0) - 2, "L.T.", 4, anchor="end")
+    txt(M + 3, Y(0) - 2, "x", 4)
+    txt(X(0) + 2, H - M - 4, "y", 4)
+
+    x0, y0 = W - M - TB_W, H - M - TB_H
+    parts.append(
+        f'<rect x="{x0}" y="{y0}" width="{TB_W}" height="{TB_H}" fill="#ffffff" stroke="#111827" stroke-width="0.5"/>'
+    )
+    parts.append(
+        f'<line x1="{x0}" y1="{y0 + TB_H / 2}" x2="{x0 + TB_W}" y2="{y0 + TB_H / 2}" stroke="#111827" stroke-width="0.3"/>'
+    )
+    parts.append(
+        f'<line x1="{x0 + 45}" y1="{y0 + TB_H / 2}" x2="{x0 + 45}" y2="{y0 + TB_H}" stroke="#111827" stroke-width="0.3"/>'
+    )
+    txt(x0 + 3, y0 + 9, title, 5.5, bold=True)
+    txt(x0 + TB_W - 3, y0 + 9, "CAD Assistant", 3.5, anchor="end")
+    txt(x0 + 3, y0 + TB_H - 4, f"Scala {scale_txt}", 5)
+    txt(x0 + 48, y0 + TB_H - 4, "Proiezioni ortogonali - metodo europeo", 4)
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}">'
+        + "".join(parts)
+        + "</svg>"
+    )
+    return svg, fits, sheet
+
+
+# ------------------------------ Gemini (foto -> solido) ----------------------
+def get_gemini_key():
+    try:
+        k = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        k = ""
+    return str(k or os.environ.get("GEMINI_API_KEY", "") or st.session_state.get("gemini_key_input", "")).strip()
+
+
+def gemini_read_trace(path, key):
+    """Invia la foto a Gemini e restituisce il JSON del solido (testo)."""
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": GEMINI_PROMPT},
+                {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}},
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+    }
+    models = []
+    try:
+        custom = str(st.secrets.get("GEMINI_MODEL", "")).strip()
+        if custom:
+            models.append(custom)
+    except Exception:
+        pass
+    models += [m for m in GEMINI_MODELS if m not in models]
+
+    last = ""
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(
+                url, headers={"x-goog-api-key": key, "Content-Type": "application/json"}, json=body, timeout=120
+            )
+        except requests.RequestException as e:
+            last = f"Connessione non riuscita: {e}"
+            continue
+        if r.status_code == 200:
+            try:
+                cand = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in cand if not p.get("thought"))
+                text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                return json.dumps(json.loads(text), ensure_ascii=False, indent=1)
             except Exception:
-                st.warning("Impossibile mostrare l'anteprima dell'immagine.")
-        else:
-            st.info("💡 Carica la foto della traccia sopra per visualizzarla qui.")
+                last = "Risposta di Gemini non leggibile: riprova."
+                continue
+        try:
+            msg = r.json().get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        if r.status_code == 429:
+            raise RuntimeError("Quota gratuita di Gemini esaurita: riprova tra qualche minuto o domani.")
+        if r.status_code in (401, 403) or "API key" in msg:
+            raise RuntimeError("La chiave API non è valida o non è abilitata.")
+        last = msg or f"Errore {r.status_code}"
+    raise RuntimeError(last or "Nessun modello Gemini disponibile.")
 
-    with col_t2:
-        st.markdown("### 📐 Disegno Completo & Quote (Risultato Atteso)")
-        if st.session_state.uploaded_image_path and os.path.exists(st.session_state.uploaded_image_path):
-            st.success("✅ Traccia elaborata: Ecco il disegno tecnico completo con proiezioni ortogonali, Linea di Terra, assi e quote di misura calcolate in scala.")
-            # Box visivo dimostrativo del disegno completo con quote basato sulla scala attiva
-            st.markdown(f"""
-                <div class='card' style='border: 1px solid #38bdf8;'>
-                    <h4 style='color: #38bdf8; margin-top: 0;'>Elaborato in Scala {st.session_state.scala_scelta}</h4>
-                    <ul style='padding-left: 20px; line-height: 1.8;'>
-                        <li><b>Piano Verticale (PV):</b> Prospetto principale con quote geometriche esterne.</li>
-                        <li><b>Piano Orizzontale (PO):</b> Pianta in asse con profondità e dettagli interni (tratteggiati).</li>
-                        <li><b>Piano Laterale (PL):</b> Ribaltamento a 45° con verifiche di quota complete.</li>
-                        <li><b>Linea di Terra (L.T.):</b> Posizionata correttamente con squadratura F4.</li>
-                    </ul>
+
+def drawing_tab():
+    scale = st.session_state.scale
+    st.session_state.setdefault("solid_json", "")
+    st.markdown("#### Disegno completo delle tre proiezioni")
+    path = st.session_state.trace_path
+    has_trace = bool(path and Path(path).exists())
+
+    c1, c2 = st.columns(2)
+    with c1:
+        read_clicked = st.button("🔍 Riconosci dalla foto", disabled=not has_trace)
+    with c2:
+        ex_clicked = st.button("📘 Esempio: Esercitazione 14")
+    st.caption("Con «Riconosci dalla foto» l'immagine viene inviata a Google Gemini (piano gratuito).")
+
+    if ex_clicked:
+        st.session_state.solid_json = example_14_json()
+    if read_clicked:
+        key = get_gemini_key()
+        if not key:
+            st.error("Manca la chiave Gemini: mettila nei Secrets oppure incollala qui sotto.")
+        else:
+            with st.spinner("Gemini sta leggendo la traccia..."):
+                try:
+                    st.session_state.solid_json = gemini_read_trace(path, key)
+                except Exception as e:
+                    st.error(str(e))
+
+    with st.expander("🔑 Chiave API (solo se non è nei Secrets)"):
+        st.text_input("Chiave Gemini", type="password", key="gemini_key_input")
+    if has_trace:
+        with st.expander("Vedi la traccia caricata"):
+            st.image(path)
+
+    st.text_area(
+        "Solido riconosciuto (puoi correggere misure e parti)",
+        key="solid_json",
+        height=240,
+    )
+    text = st.session_state.solid_json.strip()
+    if not text:
+        st.info("Carica la traccia e tocca «Riconosci dalla foto», oppure prova l'esempio.")
+        return
+    try:
+        with st.spinner("Calcolo le proiezioni..."):
+            solid = compute_solid(text)
+    except Exception as e:
+        st.error(f"Descrizione del solido non valida: {e}")
+        return
+
+    W_, H_, D_ = solid["dims"]
+    st.caption(
+        f"{solid['descrizione']} Ingombro: {W_:.1f} × {H_:.1f} × {D_:.1f} mm "
+        "(larghezza × altezza × profondità)."
+    )
+    if solid["scala"] and str(solid["scala"]) != scale:
+        st.caption(f"L'esercizio indica la scala {solid['scala']}, ma hai selezionato {scale}.")
+    c3, c4 = st.columns(2)
+    with c3:
+        sheet = st.selectbox("Formato foglio", ["Auto"] + list(SHEETS), key="sheet_fmt")
+    with c4:
+        title = st.text_input("Titolo nel cartiglio", value=solid["titolo"])
+
+    svg, fits, used = build_projection_svg(solid, scale, sheet, title)
+    if not fits:
+        st.warning(f"Alla scala {scale} il disegno non entra bene nel formato {used}: scegli una scala più piccola.")
+    b64 = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    st.markdown(
+        '<div style="background:#fff;border-radius:12px;padding:6px;">'
+        f'<img src="data:image/svg+xml;base64,{b64}" style="width:100%;height:auto;display:block;"/></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Linea continua: spigoli in vista · tratteggiata: parti nascoste · tratto-punto: assi · "
+        f"linee sottili: proiezione. Stampato al 100% su {used} le misure sono quelle reali (scala {scale})."
+    )
+    st.download_button(
+        "⬇ Scarica il disegno (SVG)",
+        data=svg.encode("utf-8"),
+        file_name=f"proiezioni_{scale.replace(':', 'a')}.svg",
+        mime="image/svg+xml",
+    )
+
+
+def assistant_page():
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>📐 CAD Assistant — Proiezioni Ortogonali</h1>
+            <p>Sistema educativo di disegno tecnico: carica la foto della traccia,
+            scegli la scala di rappresentazione e segui la guida interattiva
+            passo-passo per costruire correttamente le proiezioni ortogonali
+            (vista frontale, pianta e vista laterale) con il metodo europeo.</p>
+            <span class="author">Creato da: ENRICO BOTTONE</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Caricamento traccia e scala -------------------------------------
+    col_up, col_scale = st.columns([2, 1])
+    with col_up:
+        st.markdown("#### 🖼️ Traccia dell'esercizio")
+        gen = st.session_state.widget_gen
+        mode = st.radio(
+            "Come vuoi caricare la traccia?",
+            ["📁 Galleria / file", "📷 Fotocamera integrata"],
+            horizontal=True,
+            key="trace_source",
+        )
+        if mode.startswith("📁"):
+            source = st.file_uploader(
+                "Carica la foto della traccia (jpg, png, webp)",
+                type=ALLOWED_EXT,
+                key=f"trace_uploader_{gen}",
+            )
+            st.caption(
+                "Consiglio da telefono: scatta prima la foto con l'app Fotocamera, "
+                "poi sceglila dalla galleria. Apri l'app nel browser (Chrome/Safari), "
+                "non dentro un'altra app."
+            )
+        else:
+            source = st.camera_input(
+                "Scatta la foto della traccia",
+                key=f"trace_camera_{gen}",
+            )
+        if source is not None:
+            sig = f"{source.name}-{source.size}"
+            if sig != st.session_state.trace_sig:
+                save_upload(source)
+        if st.session_state.trace_path:
+            if st.button("Rimuovi traccia"):
+                remove_trace()
+                st.rerun()
+
+    with col_scale:
+        st.markdown("#### 📏 Scala di rappresentazione")
+        st.selectbox(
+            "Seleziona la scala",
+            SCALES,
+            key="scale",
+        )
+        f = scale_factor(st.session_state.scale)
+        st.markdown(
+            f"""
+            <div class="card">
+                Fattore di scala: <b>{f:g}</b><br>
+                <small>misura disegno = misura reale × {f:g}</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        real = st.number_input(
+            "Misura reale (mm)", min_value=0.0, value=100.0, step=1.0
+        )
+        st.markdown(
+            f"Da tracciare sul foglio: **{real * f:g} mm**"
+        )
+
+    st.divider()
+
+    tab_draw, tab_guide = st.tabs(["📐 Disegno completo", "🧭 Guida passo-passo"])
+
+    with tab_draw:
+        drawing_tab()
+
+    with tab_guide:
+        st.markdown("### 🧭 Guida passo-passo")
+
+        steps = build_steps(st.session_state.scale)
+        total = len(steps)
+        # Protezione se il numero di passi cambiasse
+        st.session_state.current_step = max(0, min(st.session_state.current_step, total - 1))
+        idx = st.session_state.current_step
+        step = steps[idx]
+
+        left, right = st.columns([1, 1])
+
+        with left:
+            st.markdown("#### Riferimento: traccia caricata")
+            path = st.session_state.trace_path
+            if path and Path(path).exists():
+                st.image(path, caption="Traccia di riferimento")
+            else:
+                st.info("Carica la foto della traccia per vederla qui come riferimento costante.")
+
+        with right:
+            st.progress((idx + 1) / total, text=f"Passo {idx + 1} di {total}")
+            items_html = "".join(f"<li>{it}</li>" for it in step["items"])
+            st.markdown(
+                f"""
+                <div class="card">
+                    <span class="step-badge">PASSO {idx + 1} / {total}</span>
+                    <h3>{step['title']}</h3>
+                    <ul>{items_html}</ul>
+                    <div class="tip">💡 {step['tip']}</div>
                 </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.info("💡 Carica prima una traccia per sbloccare la generazione automatica del disegno completo con tutte le quote e proiezioni.")
+                """,
+                unsafe_allow_html=True,
+            )
+            b1, b2, _ = st.columns([1, 1, 2])
+            with b1:
+                st.button(
+                    "⬅ Indietro",
+                    key="btn_prev",
+                    on_click=go_prev,
+                    disabled=(idx == 0),
+                )
+            with b2:
+                st.button(
+                    "Avanti ➡",
+                    key="btn_next",
+                    on_click=go_next,
+                    args=(total,),
+                    disabled=(idx == total - 1),
+                )
+            if idx == total - 1:
+                st.success("Hai completato tutti i passaggi. Ottimo lavoro!")
 
-    st.markdown("---")
+    save_session_state()
 
-    # Passi guidati con pulsanti di navigazione
-    steps = [
-        {
-            "title": "Passo 1: Squadratura e Linea di Terra (L.T.)",
-            
+
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
+def main():
+    init_db()
+    init_state()
+    inject_css()
+
+    restore_login()
+    user = st.session_state.user
+    if not user:
+        login_page()
+        return
+
+    with st.sidebar:
+        st.markdown("## 📐 CAD Assistant")
+        st.markdown(f"**Utente:** {user['username']}")
+        st.caption(f"Ruolo: {user['role']}")
+        st.divider()
+
+        pages = ["Assistente CAD"]
+        if user["role"] == ROLE_DEV:
+            pages.append("Gestione Utenti")
+        page = st.radio("Navigazione", pages, label_visibility="collapsed")
+
+        st.divider()
+        if st.button("Esci"):
+            logout()
+            st.rerun()
+        st.caption("Creato da: ENRICO BOTTONE")
+
+    if page == "Gestione Utenti" and user["role"] == ROLE_DEV:
+        user_management_page()
+    else:
+        assistant_page()
+
+
+main()
