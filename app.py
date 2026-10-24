@@ -1348,6 +1348,26 @@ def get_gemini_key():
     return str(k or os.environ.get("GEMINI_API_KEY", "")).strip()
 
 
+def _available_flash_models(key):
+    """Modelli 'flash' che la chiave puo' usare davvero (i nomi cambiano spesso)."""
+    try:
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+            headers={"x-goog-api-key": key}, timeout=15,
+        )
+        names = [
+            m["name"].split("/")[-1]
+            for m in r.json().get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])
+        ]
+    except Exception:
+        return []
+    bad = ("image", "tts", "live", "audio", "embedding", "native", "robotics", "computer", "thinking")
+    flash = [n for n in names if "flash" in n and not any(b in n for b in bad)]
+    flash.sort(key=lambda n: ("preview" in n or "exp" in n, "lite" in n, n))
+    return flash
+
+
 def gemini_read_trace(path, key):
     """Invia la foto a Gemini e restituisce il JSON del solido (testo)."""
     with Image.open(path) as im:
@@ -1371,6 +1391,8 @@ def gemini_read_trace(path, key):
     except Exception:
         pass
     models += [m for m in GEMINI_MODELS if m not in models]
+    models += [m for m in _available_flash_models(key) if m not in models]
+    models = models[:6]
 
     errors = []
     overloaded = quota = False
@@ -1429,7 +1451,8 @@ def gemini_read_trace(path, key):
     if overloaded:
         raise RuntimeError(
             "I server gratuiti di Gemini sono sovraccarichi in questo momento. "
-            "Riprova tra uno o due minuti."
+            "Riprova tra qualche minuto, oppure usa «Costruisci a mano». "
+            f"(Modelli provati: {', '.join(models)}.)"
         )
     raise RuntimeError("Non sono riuscito a leggere la traccia. " + " | ".join(errors[-3:]))
 
@@ -1582,11 +1605,20 @@ def drawing_tab():
     path = st.session_state.trace_path
     has_trace = bool(path and Path(path).exists())
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         read_clicked = st.button("🔍 Riconosci dalla foto", disabled=not has_trace)
     with c2:
         ex_clicked = st.button("📘 Esempio: Esercitazione 14")
+    with c3:
+        hand_clicked = st.button("🛠 Costruisci a mano")
+    if hand_clicked:
+        st.session_state.solid = {
+            "titolo": "Esercitazione", "scala": None, "descrizione": "Solido costruito a mano.",
+            "parti": [json.loads(json.dumps(NEW_PARTS["box"]))],
+        }
+        st.session_state.solid["parti"][0].update(x=[0.0, 40.0], y=[0.0, 30.0], z=[0.0, 30.0])
+        st.session_state.solid_gen += 1
 
     if ex_clicked:
         st.session_state.solid = _clean_data(json.loads(example_14_json()))
@@ -1607,7 +1639,7 @@ def drawing_tab():
         with st.expander("Vedi la traccia caricata"):
             st.image(path)
     if not st.session_state.solid:
-        st.info("Carica la traccia e tocca «Riconosci dalla foto», oppure prova l'esempio.")
+        st.info("Carica la traccia e tocca «Riconosci dalla foto», oppure «Costruisci a mano» per inserire tu le misure.")
         return
 
     with st.expander("✏️ Correggi le misure"):
