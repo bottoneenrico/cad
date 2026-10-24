@@ -22,6 +22,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 import numpy as np
+import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image, ImageOps
@@ -928,6 +929,38 @@ def _hidden4(P, dirv, add, sub, delta=0.02):
     return res
 
 
+def _close(p, q, tol=0.35):
+    return abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
+
+
+def _sym_axes(vis, hid, ext=3.0):
+    """Assi (tratto-punto) per le viste simmetriche che hanno dettagli interni."""
+    segs = [("v", a, b) for a, b in vis] + [("h", a, b) for a, b in hid]
+    if len(segs) <= 4:
+        return []
+    xs = [pt[0] for _, a, b in segs for pt in (a, b)]
+    ys = [pt[1] for _, a, b in segs for pt in (a, b)]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+
+    def symmetric(mirror):
+        for k, a, b in segs:
+            ma, mb = mirror(a), mirror(b)
+            if not any(
+                k == k2 and ((_close(ma, a2) and _close(mb, b2)) or (_close(ma, b2) and _close(mb, a2)))
+                for k2, a2, b2 in segs
+            ):
+                return False
+        return True
+
+    out = []
+    if symmetric(lambda q: (2 * cx - q[0], q[1])):
+        out.append(((cx, y0 - ext), (cx, y1 + ext)))
+    if symmetric(lambda q: (q[0], 2 * cy - q[1])):
+        out.append(((x0 - ext, cy), (x1 + ext, cy)))
+    return out
+
+
 def _snap(t, cand, tol):
     if cand.size:
         k = int(np.argmin(np.abs(cand - t)))
@@ -1127,10 +1160,11 @@ def compute_solid(json_text):
             if not curve:
                 for q in (pa_, pb_):
                     pts.add((round(float(q[ia]), 2), round(float(q[ib]), 2)))
+        vm, hm = _merge(vis_s), _merge(hid_s)
         views[name] = {
-            "v": _merge(vis_s),
-            "h": _merge(hid_s),
-            "a": _merge(_axis_lines(cyls, dims, vi, ia, ib)),
+            "v": vm,
+            "h": hm,
+            "a": _merge(_axis_lines(cyls, dims, vi, ia, ib) + _sym_axes(vm, hm)),
             "pts": sorted(pts),
         }
     return {
@@ -1146,22 +1180,27 @@ def compute_solid(json_text):
 def build_projection_svg(solid, scale_txt, sheet, title):
     s = scale_factor(scale_txt)
     Wd, Hd, Dd = (v * s for v in solid["dims"])
-    A_P, B_P, G_P = 25.0, 25.0, 25.0     # distanze sul foglio (mm)
     M, TB_W, TB_H = 10, 150, 26
-
-    xmin, xmax = -(G_P + Wd), B_P + Dd
-    zmax, zmin = A_P + Hd, -(B_P + Dd)
-    dw, dh = xmax - xmin, zmax - zmin
+    base = 18.0
+    dw0, dh0 = Wd + Dd + 2 * base, Hd + Dd + 2 * base
 
     def fits_on(sh):
         w_, h_ = SHEETS[sh]
-        return dw <= (w_ - 2 * M) - 20 and dh <= (h_ - 2 * M - (TB_H + 4)) - 10
+        return dw0 <= (w_ - 2 * M) - 20 and dh0 <= (h_ - 2 * M - (TB_H + 4)) - 10
 
     if sheet == "Auto":
         sheet = next((sh for sh in ("A4", "A3", "A2") if fits_on(sh)), "A2")
     fits = fits_on(sheet)
     W, H = SHEETS[sheet]
     area_w, area_h = W - 2 * M, H - 2 * M - (TB_H + 4)
+    # spazi tra le viste: crescono per riempire meglio il foglio
+    free = min((area_w - 24 - dw0) / 2, (area_h - 14 - dh0) / 2)
+    g = base + max(0.0, min(free, 27.0))
+    A_P = B_P = G_P = g
+
+    xmin, xmax = -(G_P + Wd), B_P + Dd
+    zmax, zmin = A_P + Hd, -(B_P + Dd)
+    dw, dh = xmax - xmin, zmax - zmin
     ox = M + (area_w - dw) / 2 - xmin
     oy = M + (area_h - dh) / 2 + zmax
 
@@ -1268,7 +1307,7 @@ def get_gemini_key():
         k = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
         k = ""
-    return str(k or os.environ.get("GEMINI_API_KEY", "") or st.session_state.get("gemini_key_input", "")).strip()
+    return str(k or os.environ.get("GEMINI_API_KEY", "")).strip()
 
 
 def gemini_read_trace(path, key):
@@ -1327,9 +1366,150 @@ def gemini_read_trace(path, key):
     raise RuntimeError(last or "Nessun modello Gemini disponibile.")
 
 
+def _clean_data(data):
+    """Normalizza la risposta (Gemini o esempio): scarta le parti incomplete."""
+    if not isinstance(data, dict):
+        raise ValueError("risposta non valida")
+    parti = []
+    for p in data.get("parti") or []:
+        if not isinstance(p, dict):
+            continue
+        op = "sub" if p.get("op") == "sub" else "add"
+        try:
+            if p.get("tipo") == "box":
+                parti.append({
+                    "op": op, "tipo": "box",
+                    "x": [float(v) for v in p["x"][:2]],
+                    "y": [float(v) for v in p["y"][:2]],
+                    "z": [float(v) for v in p["z"][:2]],
+                })
+            elif p.get("tipo") == "prisma":
+                axis = p.get("asse") if p.get("asse") in AX else "z"
+                parti.append({
+                    "op": op, "tipo": "prisma", "asse": axis,
+                    "profilo": [[float(a), float(b)] for a, b in p["profilo"]],
+                    "da": float(p["da"]), "a": float(p["a"]),
+                })
+            elif p.get("tipo") == "cilindro":
+                axis = p.get("asse") if p.get("asse") in AX else "z"
+                parti.append({
+                    "op": op, "tipo": "cilindro", "asse": axis,
+                    "centro": [float(p["centro"][0]), float(p["centro"][1])],
+                    "raggio": float(p["raggio"]),
+                    "da": float(p["da"]), "a": float(p["a"]),
+                })
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+    if not parti:
+        raise ValueError("nessuna parte riconosciuta nella risposta")
+    return {
+        "titolo": str(data.get("titolo") or "Esercitazione"),
+        "scala": data.get("scala"),
+        "descrizione": str(data.get("descrizione") or ""),
+        "parti": parti,
+    }
+
+
+TIPI = {"box": "Parallelepipedo", "prisma": "Prisma", "cilindro": "Cilindro"}
+OPS = {"add": "Aggiungi materiale", "sub": "Togli materiale (foro / scasso)"}
+PLANE_NAMES = {"z": ("x", "y"), "x": ("y", "z"), "y": ("x", "z")}
+NEW_PARTS = {
+    "box": {"op": "add", "tipo": "box", "x": [0.0, 20.0], "y": [0.0, 20.0], "z": [0.0, 20.0]},
+    "cilindro": {"op": "sub", "tipo": "cilindro", "asse": "z", "centro": [10.0, 10.0], "raggio": 4.0, "da": -1.0, "a": 21.0},
+    "prisma": {"op": "add", "tipo": "prisma", "asse": "z", "profilo": [[0.0, 0.0], [20.0, 0.0], [0.0, 20.0]], "da": 0.0, "a": 20.0},
+}
+
+
+def _num_in(label, value, key):
+    return st.number_input(label, value=float(value), step=1.0, format="%.2f", key=key)
+
+
+def solid_editor():
+    """Editor semplice delle parti del solido: aggiorna st.session_state.solid."""
+    data = st.session_state.solid
+    gen = st.session_state.solid_gen
+    st.caption(
+        "x = larghezza (sinistra → destra) · y = altezza (basso → alto) · z = profondità (dalla faccia frontale al fondo). "
+        "Misure in mm."
+    )
+    new_parts, delete_idx = [], None
+    for i, p in enumerate(data["parti"]):
+        k = f"g{gen}_{i}"
+        tipo = p["tipo"]
+        head = f"{i + 1}. {'➕' if p['op'] == 'add' else '➖'} {TIPI[tipo]}"
+        with st.expander(head):
+            op = st.selectbox(
+                "Operazione", list(OPS), index=list(OPS).index(p["op"]), format_func=OPS.get, key=k + "op"
+            )
+            q = {"op": op, "tipo": tipo}
+            if tipo == "box":
+                c1, c2 = st.columns(2)
+                with c1:
+                    x0 = _num_in("x da (sinistra)", p["x"][0], k + "x0")
+                    y0 = _num_in("y da (basso)", p["y"][0], k + "y0")
+                    z0 = _num_in("z da (fronte)", p["z"][0], k + "z0")
+                with c2:
+                    x1 = _num_in("x a (destra)", p["x"][1], k + "x1")
+                    y1 = _num_in("y a (alto)", p["y"][1], k + "y1")
+                    z1 = _num_in("z a (fondo)", p["z"][1], k + "z1")
+                q.update(x=[x0, x1], y=[y0, y1], z=[z0, z1])
+            else:
+                axis = st.selectbox(
+                    "Asse", ["x", "y", "z"], index=["x", "y", "z"].index(p["asse"]), key=k + "as"
+                )
+                na, nb = PLANE_NAMES[axis]
+                c1, c2 = st.columns(2)
+                with c1:
+                    t0 = _num_in(f"{axis} da", p["da"], k + "da")
+                with c2:
+                    t1 = _num_in(f"{axis} a", p["a"], k + "a")
+                q.update(asse=axis, da=t0, a=t1)
+                if tipo == "cilindro":
+                    c3, c4, c5 = st.columns(3)
+                    with c3:
+                        ca = _num_in(f"centro {na}", p["centro"][0], k + "ca")
+                    with c4:
+                        cb = _num_in(f"centro {nb}", p["centro"][1], k + "cb")
+                    with c5:
+                        r = _num_in("raggio", p["raggio"], k + "r")
+                    q.update(centro=[ca, cb], raggio=r)
+                else:
+                    st.caption(f"Punti del profilo ({na}, {nb}) — puoi aggiungere o togliere righe.")
+                    df = pd.DataFrame(p["profilo"], columns=[na, nb])
+                    ed = st.data_editor(
+                        df, num_rows="dynamic", hide_index=True, key=f"{k}prof{axis}"
+                    )
+                    q["profilo"] = [[float(a), float(b)] for a, b in ed.dropna().values.tolist()]
+            if st.button("🗑 Elimina questa parte", key=k + "del"):
+                delete_idx = i
+        new_parts.append(q)
+    st.session_state.solid["parti"] = new_parts
+
+    st.markdown("**Aggiungi una parte**")
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        add_box = st.button("➕ Blocco", key=f"g{gen}_addbox")
+    with b2:
+        add_cyl = st.button("➕ Cilindro", key=f"g{gen}_addcyl")
+    with b3:
+        add_pri = st.button("➕ Prisma", key=f"g{gen}_addpri")
+    changed = False
+    if delete_idx is not None:
+        st.session_state.solid["parti"].pop(delete_idx)
+        changed = True
+    for clicked, name in ((add_box, "box"), (add_cyl, "cilindro"), (add_pri, "prisma")):
+        if clicked:
+            st.session_state.solid["parti"].append(json.loads(json.dumps(NEW_PARTS[name])))
+            changed = True
+    if changed:
+        st.session_state.solid_gen += 1
+        st.rerun()
+
+
 def drawing_tab():
     scale = st.session_state.scale
-    st.session_state.setdefault("solid_json", "")
+    st.session_state.setdefault("solid", None)
+    st.session_state.setdefault("solid_gen", 0)
     st.markdown("#### Disegno completo delle tre proiezioni")
     path = st.session_state.trace_path
     has_trace = bool(path and Path(path).exists())
@@ -1339,55 +1519,50 @@ def drawing_tab():
         read_clicked = st.button("🔍 Riconosci dalla foto", disabled=not has_trace)
     with c2:
         ex_clicked = st.button("📘 Esempio: Esercitazione 14")
-    st.caption("Con «Riconosci dalla foto» l'immagine viene inviata a Google Gemini (piano gratuito).")
 
     if ex_clicked:
-        st.session_state.solid_json = example_14_json()
+        st.session_state.solid = _clean_data(json.loads(example_14_json()))
+        st.session_state.solid_gen += 1
     if read_clicked:
         key = get_gemini_key()
         if not key:
-            st.error("Manca la chiave Gemini: mettila nei Secrets oppure incollala qui sotto.")
+            st.error("Chiave Gemini non trovata nei Secrets dell'app.")
         else:
-            with st.spinner("Gemini sta leggendo la traccia..."):
+            with st.spinner("Sto leggendo la traccia..."):
                 try:
-                    st.session_state.solid_json = gemini_read_trace(path, key)
+                    st.session_state.solid = _clean_data(json.loads(gemini_read_trace(path, key)))
+                    st.session_state.solid_gen += 1
                 except Exception as e:
                     st.error(str(e))
 
-    with st.expander("🔑 Chiave API (solo se non è nei Secrets)"):
-        st.text_input("Chiave Gemini", type="password", key="gemini_key_input")
     if has_trace:
         with st.expander("Vedi la traccia caricata"):
             st.image(path)
-
-    st.text_area(
-        "Solido riconosciuto (puoi correggere misure e parti)",
-        key="solid_json",
-        height=240,
-    )
-    text = st.session_state.solid_json.strip()
-    if not text:
+    if not st.session_state.solid:
         st.info("Carica la traccia e tocca «Riconosci dalla foto», oppure prova l'esempio.")
         return
+
+    with st.expander("✏️ Correggi le misure"):
+        solid_editor()
+    data = st.session_state.solid
     try:
         with st.spinner("Calcolo le proiezioni..."):
-            solid = compute_solid(text)
+            solid = compute_solid(json.dumps(data, sort_keys=True, ensure_ascii=False))
     except Exception as e:
-        st.error(f"Descrizione del solido non valida: {e}")
+        st.error(f"Non riesco a disegnare questo solido: {e}")
         return
 
     W_, H_, D_ = solid["dims"]
-    st.caption(
-        f"{solid['descrizione']} Ingombro: {W_:.1f} × {H_:.1f} × {D_:.1f} mm "
-        "(larghezza × altezza × profondità)."
-    )
-    if solid["scala"] and str(solid["scala"]) != scale:
-        st.caption(f"L'esercizio indica la scala {solid['scala']}, ma hai selezionato {scale}.")
+    if data["descrizione"]:
+        st.caption(data["descrizione"])
+    st.caption(f"Ingombro: {W_:.1f} × {H_:.1f} × {D_:.1f} mm (larghezza × altezza × profondità).")
+    if data["scala"] and str(data["scala"]) != scale:
+        st.caption(f"L'esercizio indica la scala {data['scala']}, ma hai selezionato {scale}.")
     c3, c4 = st.columns(2)
     with c3:
         sheet = st.selectbox("Formato foglio", ["Auto"] + list(SHEETS), key="sheet_fmt")
     with c4:
-        title = st.text_input("Titolo nel cartiglio", value=solid["titolo"])
+        title = st.text_input("Titolo nel cartiglio", value=data["titolo"])
 
     svg, fits, used = build_projection_svg(solid, scale, sheet, title)
     if not fits:
