@@ -671,7 +671,7 @@ LINE_STYLES = {
 }
 
 AX = {"x": 0, "y": 1, "z": 2}
-CYL_FACETS = 48          # multiplo di 4
+CYL_FACETS = 96          # multiplo di 4
 MAX_PARTS = 40
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash-latest"]
 
@@ -692,6 +692,10 @@ Tipi di parte:
 - {"op":"add","tipo":"cilindro","asse":"z","centro":[a,b],"raggio":r,"da":t0,"a":t1}
   centro: asse z -> [x,y]; asse x -> [y,z]; asse y -> [x,z].
 Regole: i fori/scassi ("sub") devono sporgere di 1 mm oltre le facce che attraversano se sono passanti.
+Suggerimenti: una scanalatura o asola con fondo/estremita' arrotondata = box + cilindro da togliere; una faccia
+inclinata o uno smusso = prisma con profilo poligonale; un foro cieco = cilindro "sub" che NON attraversa tutto.
+Controlla che le quote parziali sommate diano la quota totale e che ogni quota dell'immagine sia rispettata.
+In assonometria la direzione inclinata e' la profondita' z. Non inventare parti che non si vedono.
 Usa le quote scritte sull'esercizio; se una quota manca, stimala dalle proporzioni. Il solido puo' essere
 composto da piu' parti "add" che si toccano o si sovrappongono.
 
@@ -1160,6 +1164,16 @@ def compute_solid(json_text):
             if not curve:
                 for q in (pa_, pb_):
                     pts.add((round(float(q[ia]), 2), round(float(q[ib]), 2)))
+        for axis_, ca_, cb_, r_, t0_, t1_ in cyls:
+            ax_ = AX[axis_]
+            pa_, pb_ = _perp(axis_)
+            for da_ in (-r_, 0.0, r_):
+                for db_ in (-r_, 0.0, r_):
+                    for tt_ in (t0_, t1_):
+                        q_ = [0.0, 0.0, 0.0]
+                        q_[pa_], q_[pb_] = ca_ + da_, cb_ + db_
+                        q_[ax_] = min(max(tt_, 0.0), dims[ax_])
+                        pts.add((round(q_[ia], 2), round(q_[ib], 2)))
         vm, hm = _merge(vis_s), _merge(hid_s)
         views[name] = {
             "v": vm,
@@ -1180,22 +1194,35 @@ def compute_solid(json_text):
 def build_projection_svg(solid, scale_txt, sheet, title):
     s = scale_factor(scale_txt)
     Wd, Hd, Dd = (v * s for v in solid["dims"])
-    M, TB_W, TB_H = 10, 150, 26
-    base = 18.0
-    dw0, dh0 = Wd + Dd + 2 * base, Hd + Dd + 2 * base
+    M = 10
+    GMIN, GCOMF, GMAX = 6.0, 18.0, 27.0
+    BAND = (150.0, 26.0)     # cartiglio standard (fascia in basso)
+    SIDE = (72.0, 24.0)      # cartiglio compatto, nell'angolo a destra
 
-    def fits_on(sh):
+    def layout(sh, g):
         w_, h_ = SHEETS[sh]
-        return dw0 <= (w_ - 2 * M) - 20 and dh0 <= (h_ - 2 * M - (TB_H + 4)) - 10
+        dw_, dh_ = Wd + Dd + 2 * g, Hd + Dd + 2 * g
+        if dh_ + 10 <= h_ - 2 * M - (BAND[1] + 4) and dw_ + 20 <= w_ - 2 * M:
+            return "band"
+        if dh_ + 4 <= h_ - 2 * M and dw_ + 8 <= w_ - 2 * M - (SIDE[0] + 6):
+            return "side"
+        return None
 
     if sheet == "Auto":
-        sheet = next((sh for sh in ("A4", "A3", "A2") if fits_on(sh)), "A2")
-    fits = fits_on(sheet)
+        sheet = next((sh for sh in SHEETS if layout(sh, GMIN)), "A2")
+    mode = layout(sheet, GCOMF) or layout(sheet, GMIN)
+    fits = mode is not None
+    mode = mode or "band"
     W, H = SHEETS[sheet]
-    area_w, area_h = W - 2 * M, H - 2 * M - (TB_H + 4)
-    # spazi tra le viste: crescono per riempire meglio il foglio
-    free = min((area_w - 24 - dw0) / 2, (area_h - 14 - dh0) / 2)
-    g = base + max(0.0, min(free, 27.0))
+    tbw, tbh = BAND if mode == "band" else SIDE
+    if mode == "band":
+        area_w, area_h = W - 2 * M, H - 2 * M - (tbh + 4)
+        slack_w, slack_h = 20, 10
+    else:
+        area_w, area_h = W - 2 * M - (tbw + 6), H - 2 * M
+        slack_w, slack_h = 8, 4
+    g = min((area_w - slack_w - (Wd + Dd)) / 2, (area_h - slack_h - (Hd + Dd)) / 2)
+    g = max(GMIN, min(g, GMAX))
     A_P = B_P = G_P = g
 
     xmin, xmax = -(G_P + Wd), B_P + Dd
@@ -1229,8 +1256,10 @@ def build_projection_svg(solid, scale_txt, sheet, title):
             f'<line x1="{X(p[0]):.2f}" y1="{Y(p[1]):.2f}" x2="{X(q[0]):.2f}" y2="{Y(q[1]):.2f}" {LINE_STYLES[k]}/>'
         )
 
-    def txt(x, y, t, size=5, anchor="start", bold=False):
+    def txt(x, y, t, size=5, anchor="start", bold=False, max_w=None):
         w = ' font-weight="bold"' if bold else ""
+        if max_w and len(t) * size * 0.56 > max_w:
+            w += f' textLength="{max_w:.1f}" lengthAdjust="spacingAndGlyphs"'
         parts.append(
             f'<text x="{x:.2f}" y="{y:.2f}" font-size="{size}" font-family="Arial, Helvetica, sans-serif" '
             f'fill="#111827" text-anchor="{anchor}"{w}>{escape(t)}</text>'
@@ -1242,7 +1271,7 @@ def build_projection_svg(solid, scale_txt, sheet, title):
     )
     parts.append(f'<line x1="{M}" y1="{Y(0):.2f}" x2="{W - M}" y2="{Y(0):.2f}" {LINE_STYLES["t"]}/>')
     parts.append(f'<line x1="{X(0):.2f}" y1="{M}" x2="{X(0):.2f}" y2="{H - M}" {LINE_STYLES["t"]}/>')
-    tb = B_P + Dd + 8
+    tb = B_P + Dd + 4
     ln((0, 0), (tb, -tb), "t")  # bisettrice
 
     views = solid["views"]
@@ -1278,20 +1307,28 @@ def build_projection_svg(solid, scale_txt, sheet, title):
     txt(M + 3, Y(0) - 2, "x", 4)
     txt(X(0) + 2, H - M - 4, "y", 4)
 
-    x0, y0 = W - M - TB_W, H - M - TB_H
+    x0, y0 = W - M - tbw, H - M - tbh
+    half = tbh / 2
+    cut = min(46.0, tbw * 0.34)
+    small = mode == "side"
     parts.append(
-        f'<rect x="{x0}" y="{y0}" width="{TB_W}" height="{TB_H}" fill="#ffffff" stroke="#111827" stroke-width="0.5"/>'
+        f'<rect x="{x0:.2f}" y="{y0:.2f}" width="{tbw}" height="{tbh}" fill="#ffffff" stroke="#111827" stroke-width="0.5"/>'
     )
     parts.append(
-        f'<line x1="{x0}" y1="{y0 + TB_H / 2}" x2="{x0 + TB_W}" y2="{y0 + TB_H / 2}" stroke="#111827" stroke-width="0.3"/>'
+        f'<line x1="{x0:.2f}" y1="{y0 + half:.2f}" x2="{x0 + tbw:.2f}" y2="{y0 + half:.2f}" stroke="#111827" stroke-width="0.3"/>'
     )
     parts.append(
-        f'<line x1="{x0 + 45}" y1="{y0 + TB_H / 2}" x2="{x0 + 45}" y2="{y0 + TB_H}" stroke="#111827" stroke-width="0.3"/>'
+        f'<line x1="{x0 + cut:.2f}" y1="{y0 + half:.2f}" x2="{x0 + cut:.2f}" y2="{y0 + tbh:.2f}" stroke="#111827" stroke-width="0.3"/>'
     )
-    txt(x0 + 3, y0 + 9, title, 5.5, bold=True)
-    txt(x0 + TB_W - 3, y0 + 9, "CAD Assistant", 3.5, anchor="end")
-    txt(x0 + 3, y0 + TB_H - 4, f"Scala {scale_txt}", 5)
-    txt(x0 + 48, y0 + TB_H - 4, "Proiezioni ortogonali - metodo europeo", 4)
+    txt(x0 + 2.5, y0 + half - 3.5, title, 4.4 if small else 5.5, bold=True, max_w=tbw - 5 - (0 if small else 28))
+    if not small:
+        txt(x0 + tbw - 3, y0 + half - 3.5, "CAD Assistant", 3.5, anchor="end")
+    txt(x0 + 2.5, y0 + tbh - 3.5, f"Scala {scale_txt}", 4.4 if small else 5)
+    txt(
+        x0 + cut + 2.5, y0 + tbh - 3.5,
+        "Proiezioni ortogonali" + ("" if small else " - metodo europeo"),
+        3.4 if small else 4, max_w=tbw - cut - 5,
+    )
 
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}">'
@@ -1566,7 +1603,10 @@ def drawing_tab():
 
     svg, fits, used = build_projection_svg(solid, scale, sheet, title)
     if not fits:
-        st.warning(f"Alla scala {scale} il disegno non entra bene nel formato {used}: scegli una scala più piccola.")
+        st.warning(
+            f"Alla scala {scale} il solido è troppo grande per il formato {used}, anche con il cartiglio compatto: "
+            "scegli un formato più grande (A2) oppure una scala più piccola."
+        )
     b64 = base64.b64encode(svg.encode("utf-8")).decode("ascii")
     st.markdown(
         '<div style="background:#fff;border-radius:12px;padding:6px;">'
