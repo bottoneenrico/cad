@@ -1370,7 +1370,7 @@ mancanti e solo per viste ortogonali fotografate frontalmente. In assonometria l
 accorciate: non misurare con la griglia e scrivilo in "avvisi"."""
 
 
-def _close(mask, it=2):
+def _morph_close(mask, it=2):
     m = mask
     for _ in range(it):
         q = np.pad(m, 1)
@@ -1422,7 +1422,7 @@ def detect_coin(path):
     total = hue.size
     best = None
     for thr in (140, 110, 85):
-        mask = _close(base & (sat >= thr))
+        mask = _morph_close(base & (sat >= thr))
         for pts in _components(mask.tolist(), max(60, int(total * 0.0008))):
             n = len(pts)
             if n > total * 0.15:
@@ -1796,8 +1796,15 @@ def groq_read_trace(path, key, ppm=None, scala_txt="1:1"):
     except Exception:
         pass
     models += [m for m in GROQ_MODELS if m not in models and (not avail or m in avail)]
+    keys = ("scout", "maverick", "llama-4", "vision", "-vl", "qwen3.6", "qwen3.5", "pixtral", "gemma-3", "gemma3")
+    models += [m for m in avail if m not in models and any(k in m.lower() for k in keys)]
+    models = models[:5]
     if not models:
-        raise RuntimeError("nessun modello con lettura immagini disponibile su Groq")
+        sample = ", ".join(avail[:8]) or "nessuno"
+        raise RuntimeError(
+            "nessun modello di Groq che legge le immagini per questa chiave. "
+            f"Modelli visti: {sample}. Puoi indicarne uno nei Secrets con GROQ_MODEL = \"nome-del-modello\"."
+        )
     errors = []
     t_start = time.time()
     for model in models:
