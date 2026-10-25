@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import io
 import json
+import re as _re
 import math
 import re
 import os
@@ -26,7 +27,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 
 # ----------------------------------------------------------------------------
 # CONFIGURAZIONE
@@ -337,6 +338,8 @@ def init_state():
         "scale": "1:1",
         "token": None,
         "widget_gen": 0,
+        "coin": None,
+        "coin_checked": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -637,6 +640,8 @@ def save_upload(uploaded) -> None:
     st.session_state.trace_path = str(dest)
     st.session_state.trace_sig = f"{uploaded.name}-{uploaded.size}"
     st.session_state.current_step = 0
+    st.session_state.coin = None
+    st.session_state.coin_checked = False
 
 
 def remove_trace():
@@ -649,6 +654,8 @@ def remove_trace():
     st.session_state.trace_path = None
     st.session_state.trace_sig = None
     st.session_state.current_step = 0
+    st.session_state.coin = None
+    st.session_state.coin_checked = False
     st.session_state.widget_gen += 1
 
 
@@ -702,8 +709,9 @@ composto da piu' parti "add" che si toccano o si sovrappongono.
 
 Formato di risposta:
 {"titolo":"Esercitazione N","scala":"1:1","descrizione":"breve descrizione in italiano",
- "parti":[ ... ]}
-("scala" e' quella indicata nel testo dell'esercizio, oppure null.)
+ "avvisi":["dubbi o misure stimate"], "parti":[ ... ]}
+("scala" e' quella indicata nel testo dell'esercizio, oppure null; "avvisi" e' un elenco, anche vuoto,
+di dubbi: quote illeggibili o misure stimate.)
 
 Esempio: parallelepipedo 40x20x30 con foro cilindrico passante di diametro 10 lungo z al centro:
 {"titolo":"Esempio","scala":null,"descrizione":"Blocco con foro","parti":[
@@ -1348,6 +1356,153 @@ def get_gemini_key():
     return str(k or os.environ.get("GEMINI_API_KEY", "")).strip()
 
 
+# ------------------------------ Moneta da 50 centesimi (scala della foto) -----
+COIN_MM = 24.25   # diametro della moneta da 50 centesimi di euro
+
+def coin_note(scala_txt):
+    return f"""
+
+CALIBRAZIONE: nella foto c'e' una moneta da 50 centesimi di euro (diametro 24,25 mm). La SECONDA immagine e' la
+stessa foto con una griglia calibrata sulla moneta: la figura sul foglio e' disegnata in scala {scala_txt}, quindi la
+griglia e' gia' espressa in millimetri REALI del solido (linee ogni 10 mm reali, piu' marcate ogni 50 mm, numeri in mm
+dall'angolo in alto a sinistra). Le quote scritte hanno SEMPRE la priorita'. Usa la griglia solo per stimare le quote
+mancanti e solo per viste ortogonali fotografate frontalmente. In assonometria le lunghezze lungo gli assi sono
+accorciate: non misurare con la griglia e scrivilo in "avvisi"."""
+
+
+def _close(mask, it=2):
+    m = mask
+    for _ in range(it):
+        q = np.pad(m, 1)
+        m = q[1:-1, 1:-1] | q[:-2, 1:-1] | q[2:, 1:-1] | q[1:-1, :-2] | q[1:-1, 2:]
+    for _ in range(it):
+        q = np.pad(m, 1, constant_values=True)
+        m = q[1:-1, 1:-1] & q[:-2, 1:-1] & q[2:, 1:-1] & q[1:-1, :-2] & q[1:-1, 2:]
+    return m
+
+
+def _components(mask, min_pix):
+    h = len(mask)
+    w = len(mask[0]) if h else 0
+    seen = [bytearray(w) for _ in range(h)]
+    comps = []
+    for y0 in range(h):
+        row = mask[y0]
+        for x0 in range(w):
+            if not row[x0] or seen[y0][x0]:
+                continue
+            stack = [(y0, x0)]
+            seen[y0][x0] = 1
+            pts = []
+            while stack:
+                y, x = stack.pop()
+                pts.append((y, x))
+                for yy, xx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if 0 <= yy < h and 0 <= xx < w and mask[yy][xx] and not seen[yy][xx]:
+                        seen[yy][xx] = 1
+                        stack.append((yy, xx))
+            if len(pts) >= min_pix:
+                comps.append(pts)
+    return comps
+
+
+def detect_coin(path):
+    """Cerca nella foto una moneta dorata e rotonda (50 centesimi). Restituisce un dizionario o None."""
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            w0, h0 = im.size
+            k = min(1.0, 640 / max(w0, h0))
+            small = im.resize((max(1, int(w0 * k)), max(1, int(h0 * k))))
+    except Exception:
+        return None
+    hsv = np.asarray(small.convert("HSV")).astype(np.int16)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    base = (hue >= 12) & (hue <= 40) & (val >= 60)   # toni dorati / ambra
+    total = hue.size
+    best = None
+    for thr in (140, 110, 85):
+        mask = _close(base & (sat >= thr))
+        for pts in _components(mask.tolist(), max(60, int(total * 0.0008))):
+            n = len(pts)
+            if n > total * 0.15:
+                continue
+            arr = np.array(pts)
+            y0, x0 = arr.min(axis=0)
+            y1, x1 = arr.max(axis=0)
+            bw, bh = int(x1 - x0 + 1), int(y1 - y0 + 1)
+            aspect = min(bw, bh) / max(bw, bh)
+            d = (bw + bh) / 2
+            fill = n / (math.pi * (d / 2) ** 2)
+            dist = np.hypot(arr[:, 0] - arr[:, 0].mean(), arr[:, 1] - arr[:, 1].mean())
+            fill_r = n / (math.pi * max(float(np.percentile(dist, 98)), 1.0) ** 2)
+            if aspect < 0.82 or not (0.7 <= fill <= 1.1) or fill_r < 0.75:
+                continue
+            score = fill * aspect * fill_r
+            if best is None or score > best[0]:
+                best = (score, (x0 + x1) / 2, (y0 + y1) / 2, d, n)
+        if best:
+            break
+    if not best:
+        return None
+    _, cx, cy, d, n = best
+    d_px = ((d + 2 * math.sqrt(n / math.pi)) / 2) / k      # in pixel dell'immagine originale
+    return {"cx": cx / k, "cy": cy / k, "d_px": d_px, "px_per_mm": d_px / COIN_MM}
+
+
+def coin_overlay(path, coin):
+    """Foto con il cerchio della moneta riconosciuta (per controllo visivo)."""
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        f = min(1.0, 900 / max(im.size))
+        if f < 1:
+            im = im.resize((int(im.width * f), int(im.height * f)))
+    d = ImageDraw.Draw(im)
+    r = coin["d_px"] / 2 * f
+    cx, cy = coin["cx"] * f, coin["cy"] * f
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(0, 220, 80), width=4)
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _prepare_images(path, ppm=None, max_side=1400):
+    """Foto principale (JPEG) e, se la scala e' nota, la stessa foto con griglia millimetrica."""
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        f = min(1.0, max_side / max(im.size))
+        if f < 1:
+            im = im.resize((int(im.width * f), int(im.height * f)))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=86)
+    main, grid = buf.getvalue(), None
+    if ppm:
+        p = ppm * f
+        over = Image.new("RGBA", im.size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(over)
+        step = 10 * p
+        for axis_len, vertical in ((im.width, True), (im.height, False)):
+            i = 0
+            while i * step < axis_len:
+                pos = i * step
+                major = i % 5 == 0
+                col = (0, 90, 255, 150 if major else 70)
+                if vertical:
+                    d.line([(pos, 0), (pos, im.height)], fill=col, width=2 if major else 1)
+                    if major:
+                        d.text((pos + 3, 3), str(i * 10), fill=(0, 60, 200, 255))
+                else:
+                    d.line([(0, pos), (im.width, pos)], fill=col, width=2 if major else 1)
+                    if major:
+                        d.text((3, pos + 3), str(i * 10), fill=(0, 60, 200, 255))
+                i += 1
+        g = Image.alpha_composite(im.convert("RGBA"), over).convert("RGB")
+        buf2 = io.BytesIO()
+        g.save(buf2, "JPEG", quality=86)
+        grid = buf2.getvalue()
+    return main, grid
+
+
 def _available_flash_models(key):
     """Modelli 'flash' che la chiave puo' usare davvero (i nomi cambiano spesso)."""
     try:
@@ -1368,21 +1523,16 @@ def _available_flash_models(key):
     return flash
 
 
-def gemini_read_trace(path, key):
+def gemini_read_trace(path, key, ppm=None, scala_txt="1:1"):
     """Invia la foto a Gemini e restituisce il JSON del solido (testo)."""
-    with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        im.thumbnail((1600, 1600))
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=88)
-    body = {
-        "contents": [{
-            "parts": [
-                {"text": GEMINI_PROMPT},
-                {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}},
-            ]
-        }],
-    }
+    main, grid = _prepare_images(path, ppm, 1600)
+    parts_in = [
+        {"text": GEMINI_PROMPT + (coin_note(scala_txt) if grid else "")},
+        {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(main).decode("ascii")}},
+    ]
+    if grid:
+        parts_in.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(grid).decode("ascii")}})
+    body = {"contents": [{"parts": parts_in}]}
     models = []
     try:
         custom = str(st.secrets.get("GEMINI_MODEL", "")).strip()
@@ -1457,6 +1607,14 @@ def gemini_read_trace(path, key):
     raise RuntimeError("Non sono riuscito a leggere la traccia. " + " | ".join(errors[-3:]))
 
 
+def _extract_json(text):
+    """Estrae l'oggetto JSON da un testo incollato (anche con ```json e frasi attorno)."""
+    a, b = text.find("{"), text.rfind("}")
+    if a < 0 or b <= a:
+        raise ValueError("non trovo nessuna descrizione JSON nel testo incollato")
+    return json.loads(text[a:b + 1])
+
+
 def _clean_data(data):
     """Normalizza la risposta (Gemini o esempio): scarta le parti incomplete."""
     if not isinstance(data, dict):
@@ -1497,6 +1655,7 @@ def _clean_data(data):
         "titolo": str(data.get("titolo") or "Esercitazione"),
         "scala": data.get("scala"),
         "descrizione": str(data.get("descrizione") or ""),
+        "avvisi": [str(a) for a in (data.get("avvisi") if isinstance(data.get("avvisi"), list) else []) if a],
         "parti": parti,
     }
 
@@ -1597,6 +1756,85 @@ def solid_editor():
         st.rerun()
 
 
+GROQ_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.6-27b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+]
+
+
+def get_groq_key():
+    try:
+        k = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        k = ""
+    return str(k or os.environ.get("GROQ_API_KEY", "")).strip()
+
+
+def groq_read_trace(path, key, ppm=None, scala_txt="1:1"):
+    """Come gemini_read_trace, ma con Groq (molto veloce). Restituisce il JSON del solido (testo)."""
+    main, grid = _prepare_images(path, ppm, 1400)
+    content = [
+        {"type": "text", "text": GEMINI_PROMPT + (coin_note(scala_txt) if grid else "")},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(main).decode("ascii")}},
+    ]
+    if grid:
+        content.append(
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(grid).decode("ascii")}}
+        )
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=15)
+        avail = [m["id"] for m in r.json().get("data", [])]
+    except Exception:
+        avail = []
+    models = []
+    try:
+        custom = str(st.secrets.get("GROQ_MODEL", "")).strip()
+        if custom:
+            models.append(custom)
+    except Exception:
+        pass
+    models += [m for m in GROQ_MODELS if m not in models and (not avail or m in avail)]
+    if not models:
+        raise RuntimeError("nessun modello con lettura immagini disponibile su Groq")
+    errors = []
+    t_start = time.time()
+    for model in models:
+        if time.time() - t_start > 90:
+            break
+        body = {
+            "model": model, "temperature": 0.1, "max_tokens": 4096,
+            "messages": [{"role": "user", "content": content}],
+        }
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=(10, 45)
+            )
+        except requests.Timeout:
+            errors.append(f"{model}: nessuna risposta entro 45 secondi")
+            continue
+        except requests.RequestException:
+            errors.append(f"{model}: connessione non riuscita")
+            continue
+        if r.status_code == 200:
+            try:
+                text = r.json()["choices"][0]["message"]["content"] or ""
+                text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.S)
+                return json.dumps(_extract_json(text), ensure_ascii=False, indent=1)
+            except Exception:
+                errors.append(f"{model}: risposta non leggibile")
+                continue
+        try:
+            msg = r.json().get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        if r.status_code in (401, 403):
+            raise RuntimeError("la chiave Groq non è valida")
+        errors.append(f"{model}: {'limite raggiunto' if r.status_code == 429 else (msg or 'errore ' + str(r.status_code))}")
+    raise RuntimeError(" | ".join(errors[-3:]) or "nessuna risposta")
+
+
 def drawing_tab():
     scale = st.session_state.scale
     st.session_state.setdefault("solid", None)
@@ -1605,6 +1843,11 @@ def drawing_tab():
     path = st.session_state.trace_path
     has_trace = bool(path and Path(path).exists())
 
+    st.selectbox(
+        "Scala del disegno nella foto (quella in cui è disegnata la figura sul foglio)",
+        SCALES,
+        key="photo_scale",
+    )
     c1, c2, c3 = st.columns(3)
     with c1:
         read_clicked = st.button("🔍 Riconosci dalla foto", disabled=not has_trace)
@@ -1612,6 +1855,21 @@ def drawing_tab():
         ex_clicked = st.button("📘 Esempio: Esercitazione 14")
     with c3:
         hand_clicked = st.button("🛠 Costruisci a mano")
+    with st.expander("🔁 Se il riconoscimento non parte: usa Google AI Studio"):
+        st.markdown(
+            "1. Apri **aistudio.google.com** e avvia una nuova chat.\n"
+            "2. Carica la foto della traccia e incolla il testo qui sotto (usa l'icona di copia).\n"
+            "3. Copia la risposta di AI Studio e incollala nella casella, poi tocca «Usa questa descrizione»."
+        )
+        st.code(GEMINI_PROMPT, language=None)
+        st.text_area("Risposta di AI Studio", key="paste_json", height=140)
+        paste_clicked = st.button("✅ Usa questa descrizione")
+    if paste_clicked:
+        try:
+            st.session_state.solid = _clean_data(_extract_json(st.session_state.paste_json))
+            st.session_state.solid_gen += 1
+        except Exception as e:
+            st.error(f"Descrizione non valida: {e}")
     if hand_clicked:
         st.session_state.solid = {
             "titolo": "Esercitazione", "scala": None, "descrizione": "Solido costruito a mano.",
@@ -1624,17 +1882,48 @@ def drawing_tab():
         st.session_state.solid = _clean_data(json.loads(example_14_json()))
         st.session_state.solid_gen += 1
     if read_clicked:
-        key = get_gemini_key()
-        if not key:
-            st.error("Chiave Gemini non trovata nei Secrets dell'app.")
+        gkey, qkey = get_gemini_key(), get_groq_key()
+        if not gkey and not qkey:
+            st.error("Nessuna chiave trovata nei Secrets (GROQ_API_KEY o GEMINI_API_KEY).")
         else:
-            with st.spinner("Sto leggendo la traccia (anche 1 minuto)..."):
-                try:
-                    st.session_state.solid = _clean_data(json.loads(gemini_read_trace(path, key)))
-                    st.session_state.solid_gen += 1
-                except Exception as e:
-                    st.error(str(e))
+            problems = []
+            with st.spinner("Cerco la moneta da 50 centesimi..."):
+                coin = detect_coin(path)
+                if coin:
+                    coin["overlay"] = coin_overlay(path, coin)
+            st.session_state.coin = coin
+            st.session_state.coin_checked = True
+            # pixel per 1 mm REALE del solido: la figura sul foglio e' in scala photo_scale
+            ppm = coin["px_per_mm"] * scale_factor(st.session_state.photo_scale) if coin else None
+            with st.spinner("Sto leggendo la traccia..."):
+                for name, key, fn in (("Groq", qkey, groq_read_trace), ("Gemini", gkey, gemini_read_trace)):
+                    if not key:
+                        continue
+                    try:
+                        st.session_state.solid = _clean_data(json.loads(fn(path, key, ppm, st.session_state.photo_scale)))
+                        st.session_state.solid_gen += 1
+                        problems = []
+                        break
+                    except Exception as e:
+                        problems.append(f"{name}: {e}")
+            if problems:
+                st.error("\n\n".join(problems))
 
+    if st.session_state.coin_checked:
+        coin = st.session_state.coin
+        if coin:
+            st.success(
+                f"🪙 Moneta da 50 centesimi trovata: 1 mm sul foglio = {coin['px_per_mm']:.2f} pixel. "
+                f"Con la scala {st.session_state.photo_scale} del disegno, 10 mm reali = "
+                f"{10 * coin['px_per_mm'] * scale_factor(st.session_state.photo_scale):.0f} pixel."
+            )
+            with st.expander("Controlla la moneta riconosciuta"):
+                st.image(coin["overlay"], caption="Il cerchio verde deve contornare la moneta.")
+        else:
+            st.info(
+                "🪙 Moneta non trovata: uso solo le quote scritte sul foglio. "
+                "Mettila sul foglio, ben visibile e con luce uniforme."
+            )
     if has_trace:
         with st.expander("Vedi la traccia caricata"):
             st.image(path)
@@ -1645,6 +1934,8 @@ def drawing_tab():
     with st.expander("✏️ Correggi le misure"):
         solid_editor()
     data = st.session_state.solid
+    for avviso in data.get("avvisi") or []:
+        st.warning(avviso)
     try:
         with st.spinner("Calcolo le proiezioni..."):
             solid = compute_solid(json.dumps(data, sort_keys=True, ensure_ascii=False))
@@ -1708,28 +1999,15 @@ def assistant_page():
     with col_up:
         st.markdown("#### 🖼️ Traccia dell'esercizio")
         gen = st.session_state.widget_gen
-        mode = st.radio(
-            "Come vuoi caricare la traccia?",
-            ["📁 Galleria / file", "📷 Fotocamera integrata"],
-            horizontal=True,
-            key="trace_source",
+        source = st.file_uploader(
+            "Carica la foto della traccia (jpg, png, webp)",
+            type=ALLOWED_EXT,
+            key=f"trace_uploader_{gen}",
         )
-        if mode.startswith("📁"):
-            source = st.file_uploader(
-                "Carica la foto della traccia (jpg, png, webp)",
-                type=ALLOWED_EXT,
-                key=f"trace_uploader_{gen}",
-            )
-            st.caption(
-                "Consiglio da telefono: scatta prima la foto con l'app Fotocamera, "
-                "poi sceglila dalla galleria. Apri l'app nel browser (Chrome/Safari), "
-                "non dentro un'altra app."
-            )
-        else:
-            source = st.camera_input(
-                "Scatta la foto della traccia",
-                key=f"trace_camera_{gen}",
-            )
+        st.caption(
+            "Scatta la foto con la fotocamera normale del telefono e caricala da qui (archivio o galleria). "
+            "Metti una moneta da 50 centesimi accanto al disegno, sul foglio."
+        )
         if source is not None:
             sig = f"{source.name}-{source.size}"
             if sig != st.session_state.trace_sig:
