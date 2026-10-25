@@ -1356,13 +1356,13 @@ def get_gemini_key():
     return str(k or os.environ.get("GEMINI_API_KEY", "")).strip()
 
 
-# ------------------------------ Moneta da 50 centesimi (scala della foto) -----
-COIN_MM = 24.25   # diametro della moneta da 50 centesimi di euro
+# ------------------------------ Moneta da 20 centesimi (scala della foto) -----
+COIN_MM = 22.25   # diametro della moneta da 20 centesimi di euro
 
 def coin_note(scala_txt):
     return f"""
 
-CALIBRAZIONE: nella foto c'e' una moneta da 50 centesimi di euro (diametro 24,25 mm). La SECONDA immagine e' la
+CALIBRAZIONE: nella foto c'e' una moneta da 20 centesimi di euro (diametro 22,25 mm). La SECONDA immagine e' la
 stessa foto con una griglia calibrata sulla moneta: la figura sul foglio e' disegnata in scala {scala_txt}, quindi la
 griglia e' gia' espressa in millimetri REALI del solido (linee ogni 10 mm reali, piu' marcate ogni 50 mm, numeri in mm
 dall'angolo in alto a sinistra). Le quote scritte hanno SEMPRE la priorita'. Usa la griglia solo per stimare le quote
@@ -1407,7 +1407,7 @@ def _components(mask, min_pix):
 
 
 def detect_coin(path):
-    """Cerca nella foto una moneta dorata e rotonda (50 centesimi). Restituisce un dizionario o None."""
+    """Cerca nella foto una moneta dorata e rotonda (20 centesimi). Restituisce un dizionario o None."""
     try:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im).convert("RGB")
@@ -1887,7 +1887,7 @@ def drawing_tab():
             st.error("Nessuna chiave trovata nei Secrets (GROQ_API_KEY o GEMINI_API_KEY).")
         else:
             problems = []
-            with st.spinner("Cerco la moneta da 50 centesimi..."):
+            with st.spinner("Cerco la moneta da 20 centesimi..."):
                 coin = detect_coin(path)
                 if coin:
                     coin["overlay"] = coin_overlay(path, coin)
@@ -1913,7 +1913,7 @@ def drawing_tab():
         coin = st.session_state.coin
         if coin:
             st.success(
-                f"🪙 Moneta da 50 centesimi trovata: 1 mm sul foglio = {coin['px_per_mm']:.2f} pixel. "
+                f"🪙 Moneta da 20 centesimi trovata: 1 mm sul foglio = {coin['px_per_mm']:.2f} pixel. "
                 f"Con la scala {st.session_state.photo_scale} del disegno, 10 mm reali = "
                 f"{10 * coin['px_per_mm'] * scale_factor(st.session_state.photo_scale):.0f} pixel."
             )
@@ -2006,7 +2006,7 @@ def assistant_page():
         )
         st.caption(
             "Scatta la foto con la fotocamera normale del telefono e caricala da qui (archivio o galleria). "
-            "Metti una moneta da 50 centesimi accanto al disegno, sul foglio."
+            "Metti una moneta da 20 centesimi accanto al disegno, sul foglio."
         )
         if source is not None:
             sig = f"{source.name}-{source.size}"
